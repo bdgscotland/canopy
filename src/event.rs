@@ -48,6 +48,11 @@ impl EventHandler {
             let mut crossterm_events = EventStream::new();
             let mut pty_rx = pty_rx;
             let mut tick_interval = tokio::time::interval(tick_rate);
+            // Once the PTY channel closes, recv() returns None immediately and
+            // forever. Without disabling the arm, select! completes instantly
+            // in a tight loop: measured at 41.9M iterations in 5s. With a
+            // failed spawn it pegged a core and left Canopy unquittable.
+            let mut pty_open = true;
 
             loop {
                 tokio::select! {
@@ -91,7 +96,7 @@ impl EventHandler {
                         }
                     }
                     // PTY output notification — triggers immediate redraw
-                    maybe_pty = pty_rx.recv() => {
+                    maybe_pty = pty_rx.recv(), if pty_open => {
                         match maybe_pty {
                             Some(()) => {
                                 // Drain any additional pending notifications to coalesce redraws
@@ -101,7 +106,10 @@ impl EventHandler {
                                 }
                             }
                             None => {
-                                // PTY channel closed (process exited), keep running for other events
+                                // Channel closed for good. Disable this arm so
+                                // it stops completing instantly; the loop keeps
+                                // serving keys, ticks and signals.
+                                pty_open = false;
                             }
                         }
                     }

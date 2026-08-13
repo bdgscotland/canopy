@@ -149,6 +149,27 @@ impl VirtualTerminal {
         self.cols = cols;
         self.rows = rows;
 
+        // Everything else holding rows must be normalised too. Only `grid` was
+        // rebuilt, so after a widen the scrollback kept the OLD width while
+        // callers indexed it with the NEW one -- extract_text then sliced
+        // row[100..40] and panicked on the MAIN thread from a mouse release.
+        // Reachable from three ordinary actions: widen the window, wheel into
+        // scrollback, drag past the old width.
+        for row in &mut self.scrollback {
+            row.resize(cols, Cell::default());
+        }
+        if let Some(saved) = self.saved_grid.as_mut() {
+            saved.resize(rows, vec![Cell::default(); cols]);
+            for row in saved.iter_mut() {
+                row.resize(cols, Cell::default());
+            }
+        }
+        if let Some(saved) = self.saved_scrollback.as_mut() {
+            for row in saved.iter_mut() {
+                row.resize(cols, Cell::default());
+            }
+        }
+
         // Reset scroll region to full screen
         self.scroll_top = 0;
         self.scroll_bottom = rows;
@@ -344,7 +365,7 @@ impl VirtualTerminal {
                 34 => self.current_style = self.current_style.fg(Color::Blue),
                 35 => self.current_style = self.current_style.fg(Color::Magenta),
                 36 => self.current_style = self.current_style.fg(Color::Cyan),
-                37 => self.current_style = self.current_style.fg(Color::White),
+                37 => self.current_style = self.current_style.fg(Color::Gray),
                 38 => {
                     // Two wire forms. Semicolon: 38;5;N / 38;2;R;G;B -> the
                     // selector and components arrive as SEPARATE parameters.
@@ -425,7 +446,7 @@ impl VirtualTerminal {
                 44 => self.current_style = self.current_style.bg(Color::Blue),
                 45 => self.current_style = self.current_style.bg(Color::Magenta),
                 46 => self.current_style = self.current_style.bg(Color::Cyan),
-                47 => self.current_style = self.current_style.bg(Color::White),
+                47 => self.current_style = self.current_style.bg(Color::Gray),
                 48 => {
                     // Two wire forms. Semicolon: 48;5;N / 48;2;R;G;B -> the
                     // selector and components arrive as SEPARATE parameters.
@@ -787,6 +808,27 @@ impl Perform for VirtualTerminal {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        // A CSI sequence carrying an intermediate or a private marker
+        // ('?', '<', '=', '>', '!', '$', ' ', '#') shares its final byte with a
+        // standard sequence but means something entirely different. vte routes
+        // 0x3C..=0x3F into `intermediates` (vte-0.15.0/src/lib.rs:207), so the
+        // marker is always visible here.
+        //
+        // Guarding arm by arm has already failed twice: ESC[>4;2m
+        // (modifyOtherKeys) was executed as SGR 4;2 and underlined the whole
+        // screen, and ESC[<u / ESC[>1u (kitty keyboard push/pop) were executed
+        // as DECRC and teleported the cursor. Claude Code emits all three in
+        // the first 50 bytes of every session.
+        //
+        // So the precondition is stated ONCE, here: private forms must be
+        // opted into explicitly, and everything else requires no intermediate.
+        let handled_private = matches!(
+            (action, intermediates),
+            ('h' | 'l', b"?") | ('c', b">") | ('q', b">") | ('u', b"?") | ('n', b"?")
+        );
+        if !intermediates.is_empty() && !handled_private {
+            return;
+        }
         let p: Vec<u16> = params.iter().map(|p| p[0]).collect();
 
         match action {
@@ -943,10 +985,10 @@ impl Perform for VirtualTerminal {
                 }
             }
             // DECSC / DECRC via CSI s / CSI u
-            's' => {
+            's' if intermediates.is_empty() => {
                 self.saved_cursor = Some(self.cursor.clone());
             }
-            'u' => {
+            'u' if intermediates.is_empty() => {
                 if let Some(ref saved) = self.saved_cursor {
                     self.cursor = saved.clone();
                 }
@@ -973,25 +1015,60 @@ impl Perform for VirtualTerminal {
             // DSR - Device Status Report
             'n' => {
                 let code = p.first().copied().unwrap_or(0);
+                let private = intermediates == b"?";
                 match code {
-                    5 => {
-                        // Status report — respond "OK"
+                    5 if !private => {
+                        // DSR — respond "OK"
                         self.response_queue.push(b"\x1b[0n".to_vec());
                     }
                     6 => {
-                        // CPR — Cursor Position Report (1-indexed)
-                        let response = format!("\x1b[{};{}R", self.cursor.y + 1, self.cursor.x + 1);
+                        // CPR (1-indexed). The private form DECXCPR must be
+                        // answered in kind, with the '?' retained.
+                        let response = if private {
+                            format!("\x1b[?{};{};1R", self.cursor.y + 1, self.cursor.x + 1)
+                        } else {
+                            format!("\x1b[{};{}R", self.cursor.y + 1, self.cursor.x + 1)
+                        };
                         self.response_queue.push(response.into_bytes());
                     }
                     _ => {}
                 }
+            }
+            // DA1 / DA2 — Device Attributes. Claude sends ESC[c at startup.
+            // An unanswered capability probe makes us look like a broken
+            // terminal to anything that asks.
+            'c' => {
+                if intermediates == b">" {
+                    // DA2: VT220, firmware version, no cartridge.
+                    self.response_queue.push(b"\x1b[>0;10;1c".to_vec());
+                } else {
+                    // DA1: VT220 with the feature set we actually implement.
+                    self.response_queue.push(b"\x1b[?62;1;2;6;9;15;22c".to_vec());
+                }
+            }
+            // XTVERSION — Claude sends ESC[>0q at startup.
+            'q' if intermediates == b">" => {
+                self.response_queue
+                    .push(b"\x1bP>|canopy(0.1.0)\x1b\\".to_vec());
+            }
+            // Kitty keyboard protocol flags query. We implement none of it, so
+            // report zero rather than staying silent.
+            'u' if intermediates == b"?" => {
+                self.response_queue.push(b"\x1b[?0u".to_vec());
             }
             // SGR-Mouse, etc. - ignore
             _ => {}
         }
     }
 
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        // Same class as csi_dispatch. ESC # 8 (DECALN) and ESC ( B (charset
+        // selection) carry intermediates and share their final byte with
+        // ESC 8 (DECRC) and ESC B. Discarding the intermediate meant DECALN
+        // silently restored the cursor.
+        if !intermediates.is_empty() {
+            return;
+        }
         match byte {
             // IND - Index (move down, scroll if at bottom of scroll region)
             b'D' => {
@@ -1306,6 +1383,129 @@ mod tests {
         for (i, row) in vt.grid().iter().enumerate() {
             assert_eq!(row.len(), vt.cols(), "row {i} width wrong after {ctx}");
         }
+    }
+
+    #[test]
+    fn resize_normalises_scrollback_width() {
+        // resize() rebuilt `grid` but left scrollback rows at the OLD width,
+        // while callers indexed them with the NEW one. Widening then selecting
+        // in the scrollback panicked on the MAIN thread.
+        let mut vt = VirtualTerminal::new(40, 5);
+        for i in 0..16 {
+            vt.feed(format!("row{i}\r\n").as_bytes());
+        }
+        assert!(!vt.scrollback().is_empty());
+        vt.resize(120, 30);
+        for (i, row) in vt.scrollback().iter().enumerate() {
+            assert_eq!(row.len(), 120, "scrollback row {i} kept the old width");
+        }
+        assert_grid_shape(&vt, "resize with scrollback");
+    }
+
+    #[test]
+    fn alt_screen_survives_a_resize_while_active() {
+        // Entering alt screen saved the grid, a resize rebuilt only the live
+        // grid, and leaving restored a saved grid of the OLD width. Printing at
+        // the new right margin then indexed past the row.
+        let mut vt = VirtualTerminal::new(80, 24);
+        vt.feed(b"\x1b[?1049h");
+        vt.resize(100, 30);
+        vt.feed(b"\x1b[?1049l");
+        vt.feed(b"\x1b[1;95HZ");
+        assert_grid_shape(&vt, "alt screen resize round trip");
+    }
+
+    #[test]
+    fn normal_white_is_not_bright_white() {
+        // ratatui-core-0.1.2/src/style/color.rs:87,107 —
+        //   Gray  = "ANSI Color: White. Foreground: 37, Background: 47"
+        //   White = "ANSI Color: Bright White. Foreground: 97, Background: 107"
+        // Mapping 37 to White rendered normal white as bright and made 37 and
+        // 97 indistinguishable. Claude's palette leans on the normal set.
+        use ratatui::style::Color;
+        let mut vt = VirtualTerminal::new(10, 2);
+        vt.feed(b"\x1b[37mA\x1b[97mB\x1b[47mC\x1b[107mD");
+        let g = vt.grid();
+        assert_eq!(g[0][0].style.fg, Some(Color::Gray), "SGR 37 is normal white");
+        assert_eq!(g[0][1].style.fg, Some(Color::White), "SGR 97 is bright white");
+        assert_ne!(g[0][0].style.fg, g[0][1].style.fg, "37 and 97 must differ");
+        assert_eq!(g[0][2].style.bg, Some(Color::Gray), "SGR 47 is normal white bg");
+        assert_eq!(g[0][3].style.bg, Some(Color::White), "SGR 107 is bright white bg");
+    }
+
+    #[test]
+    fn private_and_intermediate_sequences_are_inert() {
+        // The alias bug class, pinned. Every one of these shares a final byte
+        // with a standard sequence but means something else. Two have already
+        // shipped as screen-corrupting bugs (ESC[>4;2m, ESC[<u).
+        use ratatui::style::Modifier;
+        for seq in [
+            &b"\x1b[>4;2m"[..], // modifyOtherKeys, not SGR 4;2
+            b"\x1b[<u",          // kitty pop,        not DECRC
+            b"\x1b[>1u",         // kitty push,       not DECRC
+            b"\x1b[?1049s",      // XTSAVE,           not DECSC
+            b"\x1b[=1c",         // DA3,              not DA1
+            b"\x1b[>2J",         // private,          not ED
+            b"\x1b[?2K",         // private,          not EL
+            b"\x1b[!p",          // DECSTR,           not unknown
+            b"\x1b[ q",          // DECSCUSR,         not XTVERSION
+            b"\x1b#8",           // DECALN,           not DECRC
+            b"\x1b(B",           // charset select,   not ESC B
+        ] {
+            let mut vt = VirtualTerminal::new(20, 5);
+            vt.feed(b"\x1b[3;7H");
+            let (x, y) = (vt.cursor().x, vt.cursor().y);
+            vt.feed(seq);
+            vt.feed(b"A");
+            let cell = &vt.grid()[y][x];
+            assert_eq!(cell.ch, "A", "{seq:?} moved the cursor");
+            assert!(
+                !cell.style.add_modifier.contains(Modifier::UNDERLINED)
+                    && !cell.style.add_modifier.contains(Modifier::DIM)
+                    && !cell.style.add_modifier.contains(Modifier::BOLD),
+                "{seq:?} changed the pen"
+            );
+            assert_grid_shape(&vt, &format!("{seq:?}"));
+        }
+    }
+
+    #[test]
+    fn decset_still_works_through_the_guard() {
+        // The guard must not make the ONE private form we do implement inert.
+        let mut vt = VirtualTerminal::new(20, 5);
+        vt.feed(b"\x1b[?25l");
+        assert!(!vt.cursor().visible, "DECRST 25 should hide the cursor");
+        vt.feed(b"\x1b[?25h");
+        assert!(vt.cursor().visible, "DECSET 25 should show the cursor");
+    }
+
+    #[test]
+    fn capability_queries_get_answered() {
+        // Claude sends ESC[>0q and ESC[c in the last 8 bytes of startup.
+        // Silence makes us look like a broken terminal to any probe.
+        let mut vt = VirtualTerminal::new(20, 5);
+        vt.feed(b"\x1b[c");
+        vt.feed(b"\x1b[>0q");
+        vt.feed(b"\x1b[>c");
+        vt.feed(b"\x1b[?u");
+        let r = vt.take_responses();
+        assert_eq!(r.len(), 4, "every query must be answered");
+        assert!(r[0].starts_with(b"\x1b[?62;"), "DA1: {:?}", r[0]);
+        assert!(r[1].starts_with(b"\x1bP>|canopy"), "XTVERSION: {:?}", r[1]);
+        assert!(r[2].starts_with(b"\x1b[>0;"), "DA2: {:?}", r[2]);
+        assert_eq!(r[3], b"\x1b[?0u", "kitty flags query");
+    }
+
+    #[test]
+    fn real_claude_startup_is_answered() {
+        // The fixture ends with the XTVERSION + DA1 probe pair.
+        let raw = include_bytes!("../tests/fixtures/claude-startup.raw");
+        let mut vt = VirtualTerminal::new(100, 30);
+        vt.feed(raw);
+        assert!(
+            !vt.take_responses().is_empty(),
+            "canopy answered none of Claude's startup probes"
+        );
     }
 
     #[test]

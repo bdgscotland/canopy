@@ -333,6 +333,22 @@ impl TerminalPane {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        let Some(bytes) = encode_key(key) else { return };
+        if let Ok(mut guard) = self.pty_writer.lock() {
+            if let Some(ref mut writer) = *guard {
+                let _ = writer.write_all(&bytes);
+                let _ = writer.flush();
+            }
+        }
+    }
+}
+
+/// Encode a key event as the bytes a terminal would send. Pure, so it can be
+/// tested without spawning a PTY -- the encoding is where the bugs live.
+/// Returns None for keys that should send nothing.
+pub fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
+    #[allow(clippy::items_after_statements)]
+    {
         // Compute modifier parameter for CSI sequences (xterm style)
         // 1=none, 2=Shift, 3=Alt, 4=Shift+Alt, 5=Ctrl, 6=Ctrl+Shift, 7=Ctrl+Alt, 8=Ctrl+Shift+Alt
         let modifier_param = |mods: KeyModifiers| -> u8 {
@@ -363,10 +379,18 @@ impl TerminalPane {
                     let mut buf = [0u8; 4];
                     let s = ch.encode_utf8(&mut buf);
                     s.as_bytes().to_vec()
-                } else if mods == KeyModifiers::CONTROL {
-                    // Ctrl+A=1 .. Ctrl+Z=26
-                    let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-                    vec![ctrl_char]
+                } else if mods == KeyModifiers::CONTROL
+                    || mods == KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                {
+                    // CONTROL|SHIFT previously fell through to the UTF-8 branch
+                    // and sent a bare letter.
+                    match ctrl_byte(c) {
+                        Some(b) => vec![b],
+                        None => {
+                            let mut buf = [0u8; 4];
+                            c.encode_utf8(&mut buf).as_bytes().to_vec()
+                        }
+                    }
                 } else if mods == KeyModifiers::ALT {
                     // Alt+char: ESC prefix + char
                     let mut v = vec![0x1b];
@@ -375,9 +399,16 @@ impl TerminalPane {
                     v.extend_from_slice(s.as_bytes());
                     v
                 } else if mods == KeyModifiers::CONTROL | KeyModifiers::ALT {
-                    // Ctrl+Alt+char: ESC prefix + ctrl char
-                    let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-                    vec![0x1b, ctrl_char]
+                    // Ctrl+Alt+char: ESC prefix + ctrl byte
+                    match ctrl_byte(c) {
+                        Some(b) => vec![0x1b, b],
+                        None => {
+                            let mut buf = [0u8; 4];
+                            let mut v = vec![0x1b];
+                            v.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                            v
+                        }
+                    }
                 } else {
                     // Fallback: send as UTF-8
                     let mut buf = [0u8; 4];
@@ -387,10 +418,20 @@ impl TerminalPane {
             }
 
             // --- Simple keys (no modifier variants) ---
-            KeyCode::Enter => vec![b'\r'],
+            KeyCode::Enter => {
+                // Alt/Option+Enter is Claude Code's documented "insert newline"
+                // binding. Dropping the modifier submitted the prompt instead.
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    vec![0x1b, b'\r']
+                } else {
+                    vec![b'\r']
+                }
+            }
             KeyCode::Backspace => {
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     vec![0x1b, 127] // Alt+Backspace (delete word)
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    vec![0x17] // Ctrl+Backspace -> ^W (delete word), was dropped
                 } else {
                     vec![127]
                 }
@@ -578,7 +619,7 @@ impl TerminalPane {
                             format!("\x1b[24;{}~", m).into_bytes()
                         }
                     }
-                    _ => return, // F13+ not commonly used
+                    _ => return None, // F13+ not commonly used
                 }
             }
 
@@ -586,16 +627,14 @@ impl TerminalPane {
             KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
 
             // Unknown keys — ignore rather than sending garbage
-            _ => return,
+            _ => return None,
         };
 
-        if let Ok(mut guard) = self.pty_writer.lock() {
-            if let Some(ref mut writer) = *guard {
-                let _ = writer.write_all(&bytes);
-                let _ = writer.flush();
-            }
-        }
+        Some(bytes)
     }
+}
+
+impl TerminalPane {
 
     /// Send pasted text wrapped in bracketed-paste escape sequences.
     /// This prevents the terminal from interpreting newlines as Enter keypresses.
@@ -700,7 +739,12 @@ impl TerminalPane {
                 } else {
                     cols
                 };
-                let text: String = row[col_start..col_end.min(row.len())]
+                // Clamp BOTH ends. col_end alone is not enough: a stale-width
+                // scrollback row can be shorter than col_start, which inverts
+                // the range and panics.
+                let hi = col_end.min(row.len());
+                let lo = col_start.min(hi);
+                let text: String = row[lo..hi]
                     .iter()
                     .map(|c| if c.ch.is_empty() { " " } else { c.ch.as_str() })
                     .collect();
@@ -812,4 +856,108 @@ fn get_process_cwd(pid: u32) -> Option<PathBuf> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn get_process_cwd(_pid: u32) -> Option<PathBuf> {
     None
+}
+
+/// Encode Ctrl+<char> the way a terminal does.
+///
+/// `(c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1)` is only correct for
+/// a-z. crossterm reports the other control bytes as their printable names
+/// (crossterm-0.29.0/src/event/sys/unix/parse.rs:106-117): 0x00 arrives as
+/// Char(' ')+CONTROL, 0x1C..=0x1F as Char('4'..'7')+CONTROL. Round-tripping
+/// those through the subtraction produced 0xC0, 0xD4..0xD7 -- bytes that are
+/// never legal UTF-8, so Claude's stdin decoder yields U+FFFD or drops them.
+/// Ctrl+/ (readline undo) and Ctrl+Space (set mark) were both corrupted.
+fn ctrl_byte(c: char) -> Option<u8> {
+    Some(match c {
+        ' ' | '@' | '2' => 0x00,
+        'a'..='z' => c as u8 & 0x1f,
+        'A'..='Z' => c as u8 & 0x1f,
+        '[' | '3' => 0x1b,
+        '\\' | '4' => 0x1c,
+        ']' | '5' => 0x1d,
+        '^' | '6' => 0x1e,
+        '_' | '7' | '/' => 0x1f,
+        '?' | '8' => 0x7f,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::encode_key;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn enc(code: KeyCode, mods: KeyModifiers) -> Vec<u8> {
+        encode_key(KeyEvent::new(code, mods)).expect("key should encode")
+    }
+
+    /// crossterm reports control bytes as their PRINTABLE names, not as the
+    /// letters the old `wrapping_sub(b'a' - 1)` assumed. Each of these round
+    /// trips a byte the outer terminal delivered correctly, so getting it wrong
+    /// means Canopy corrupts input rather than merely mishandling it.
+    /// Source: crossterm-0.29.0/src/event/sys/unix/parse.rs:106-117
+    #[test]
+    fn control_bytes_round_trip_exactly() {
+        let ctrl = KeyModifiers::CONTROL;
+        for (ch, want) in [
+            (' ', 0x00u8),  // Ctrl+Space, set mark
+            ('a', 0x01),
+            ('z', 0x1a),
+            ('[', 0x1b),
+            ('\\', 0x1c), // was 0xD4
+            (']', 0x1d),  // was 0xD5
+            ('^', 0x1e),  // was 0xD6
+            ('_', 0x1f),
+            ('/', 0x1f), // Ctrl+/, readline undo. was 0xD7
+            ('?', 0x7f),
+            ('4', 0x1c),
+            ('7', 0x1f),
+        ] {
+            let got = enc(KeyCode::Char(ch), ctrl);
+            assert_eq!(got, vec![want], "Ctrl+{ch:?} should send {want:#04x}");
+        }
+    }
+
+    #[test]
+    fn no_control_key_produces_invalid_utf8() {
+        // 0xC0 and 0xD4..0xD7 are never legal UTF-8. Claude's stdin decoder
+        // turned them into U+FFFD or dropped them.
+        let ctrl = KeyModifiers::CONTROL;
+        for ch in [' ', '\\', ']', '^', '_', '/', '?', '@', '2', '8'] {
+            let got = enc(KeyCode::Char(ch), ctrl);
+            assert!(
+                std::str::from_utf8(&got).is_ok() || got.iter().all(|b| *b < 0x80),
+                "Ctrl+{ch:?} produced non-ASCII bytes {got:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_shift_is_not_sent_as_a_bare_letter() {
+        // CONTROL|SHIFT fell through to the UTF-8 branch and sent "C".
+        let got = enc(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(got, vec![0x03]);
+    }
+
+    #[test]
+    fn alt_enter_inserts_a_newline_instead_of_submitting() {
+        // Claude Code documents Option/Alt+Enter as "insert newline". The
+        // modifier was never read, so it submitted the prompt instead.
+        assert_eq!(enc(KeyCode::Enter, KeyModifiers::ALT), vec![0x1b, b'\r']);
+        assert_eq!(enc(KeyCode::Enter, KeyModifiers::NONE), vec![b'\r']);
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_a_word() {
+        assert_eq!(enc(KeyCode::Backspace, KeyModifiers::CONTROL), vec![0x17]);
+        assert_eq!(enc(KeyCode::Backspace, KeyModifiers::ALT), vec![0x1b, 127]);
+        assert_eq!(enc(KeyCode::Backspace, KeyModifiers::NONE), vec![127]);
+    }
+
+    #[test]
+    fn ctrl_alt_uses_the_same_table() {
+        let m = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(enc(KeyCode::Char('a'), m), vec![0x1b, 0x01]);
+        assert_eq!(enc(KeyCode::Char('/'), m), vec![0x1b, 0x1f]);
+    }
 }

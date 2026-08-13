@@ -138,6 +138,35 @@ impl VirtualTerminal {
         self.parser = Some(parser);
     }
 
+    /// Clamp a cursor to the current grid. Saved cursors outlive the geometry
+    /// they were captured in, so every restore must go through this.
+    fn clamp_cursor(&self, mut c: CursorState) -> CursorState {
+        c.x = c.x.min(self.cols.saturating_sub(1));
+        c.y = c.y.min(self.rows.saturating_sub(1));
+        c
+    }
+
+    /// Return to a known-good state after the parser panicked mid-feed.
+    /// Everything derived from the byte stream is suspect, so drop it all
+    /// rather than carry corrupt state forward. The child is untouched.
+    pub fn reset_after_panic(&mut self, cols: usize, rows: usize) {
+        self.cols = cols;
+        self.rows = rows;
+        self.grid = Self::make_grid(cols, rows);
+        self.lines_evicted += (self.scrollback.len() + rows) as u64;
+        self.scrollback.clear();
+        self.scroll_offset = 0;
+        self.scroll_top = 0;
+        self.scroll_bottom = rows;
+        self.cursor = CursorState::default();
+        self.saved_cursor = None;
+        self.saved_main_cursor = None;
+        self.saved_grid = None;
+        self.saved_scrollback = None;
+        self.current_style = Style::default();
+        self.response_queue.clear();
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         if cols == self.cols && rows == self.rows {
             return;
@@ -346,8 +375,14 @@ impl VirtualTerminal {
 
         self.cursor.x += 1;
 
-        // Handle wide characters
-        if w == 2 && self.cursor.x < self.cols {
+        // Handle wide characters.
+        //
+        // This checked only `cursor.x < cols`. `cursor.y` was left over from
+        // whatever the main write above had guarded against, so a restored
+        // off-grid cursor plus one wide character (emoji, CJK) panicked here —
+        // on the PTY READER thread, which ends the session with exit code 0.
+        // A narrow character never panicked, which is why it survived.
+        if w == 2 && self.cursor.y < self.rows && self.cursor.x < self.cols {
             // Mark next cell as continuation (empty string)
             self.grid[self.cursor.y][self.cursor.x] = Cell {
                 ch: String::new(),
@@ -706,7 +741,7 @@ impl VirtualTerminal {
             self.lines_evicted += (self.scrollback.len() + self.grid.len()) as u64;
             self.scrollback = scrollback;
         }
-        if let Some(cursor) = self.saved_main_cursor.take() {
+        if let Some(cursor) = self.saved_main_cursor.take().map(|c| self.clamp_cursor(c)) {
             self.cursor = cursor;
         }
     }
@@ -1037,7 +1072,7 @@ impl Perform for VirtualTerminal {
             }
             'u' if intermediates.is_empty() => {
                 if let Some(ref saved) = self.saved_cursor {
-                    self.cursor = saved.clone();
+                    self.cursor = self.clamp_cursor(saved.clone());
                 }
             }
             // DECSTBM - Set Scrolling Region (top;bottom)
@@ -1141,7 +1176,7 @@ impl Perform for VirtualTerminal {
             // DECRC - Restore Cursor
             b'8' => {
                 if let Some(ref saved) = self.saved_cursor {
-                    self.cursor = saved.clone();
+                    self.cursor = self.clamp_cursor(saved.clone());
                 }
             }
             // RIS - Full Reset
@@ -1585,6 +1620,61 @@ mod tests {
             !vt.take_responses().is_empty(),
             "canopy answered none of Claude's startup probes"
         );
+    }
+
+    #[test]
+    fn a_restored_cursor_can_never_be_off_grid() {
+        // A saved cursor outlives the geometry it was captured in. resize()
+        // clamped the LIVE cursor but not the saved ones, and the wide-char
+        // continuation write checked x but not y -- so alt-screen exit, DECRC
+        // or CSI u after a shrink, plus one emoji, panicked on the PTY reader
+        // thread and ended the session with exit code 0.
+        //
+        // Narrow characters never panicked, which is why this survived.
+        let wide = ["\u{1F600}", "\u{4F60}", "\u{1F44D}"];
+        for save in [&b"\x1b[?1049h"[..], b"\x1b7", b"\x1b[s"] {
+            for restore in [&b"\x1b[?1049l"[..], b"\x1b8", b"\x1b[u"] {
+                for ch in wide {
+                    let mut vt = VirtualTerminal::new(140, 48);
+                    vt.feed(b"\x1b[45;1H");
+                    vt.feed(save);
+                    vt.resize(140, 20);
+                    vt.feed(restore);
+                    vt.feed(ch.as_bytes());
+                    vt.feed(b"AB");
+                    assert!(vt.cursor().y < vt.rows(), "cursor y off grid");
+                    assert!(vt.cursor().x <= vt.cols(), "cursor x off grid");
+                    assert_grid_shape(&vt, "restore after shrink");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reset_after_panic_returns_a_usable_terminal() {
+        // The breaker for an emulator panic: drop everything derived from the
+        // byte stream rather than carry corrupt state forward, and keep going.
+        let mut vt = VirtualTerminal::new(80, 24);
+        for i in 0..50 {
+            vt.feed(format!("line{i}\r\n").as_bytes());
+        }
+        vt.feed(b"\x1b[10;10H\x1b[31m");
+        let evicted_before = vt.lines_evicted();
+
+        vt.reset_after_panic(80, 24);
+
+        assert_grid_shape(&vt, "after reset");
+        assert_eq!(vt.cursor().x, 0);
+        assert_eq!(vt.cursor().y, 0);
+        assert!(vt.scrollback().is_empty());
+        assert_eq!(vt.scroll_offset(), 0);
+        assert!(vt.take_responses().is_empty());
+        // Line numbers must not be reused, or a live selection would land on
+        // new text.
+        assert!(vt.lines_evicted() > evicted_before);
+        // And it still works.
+        vt.feed(b"hello");
+        assert_eq!(vt.grid()[0][0].ch, "h");
     }
 
     #[test]

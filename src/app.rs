@@ -57,6 +57,8 @@ pub struct App {
     /// One walk at a time. Without this, a burst of events queues N walks and
     /// the last N-1 are wasted work against a tree that already changed.
     walk_in_flight: bool,
+    /// The terminal feed died but the session did not. Surfaced in the UI.
+    pub reader_failed_notice: bool,
 }
 
 /// A finished walk, tagged with the root it was for so a result that arrives
@@ -108,6 +110,7 @@ impl App {
             walk_rx,
             walk_tx,
             walk_in_flight: false,
+            reader_failed_notice: false,
         })
     }
 
@@ -134,7 +137,23 @@ impl App {
                 copy_to_clipboard(&text);
             }
         }
+        // ONLY a confirmed child exit ends Canopy. A dead reader thread
+        // freezes the pane but leaves the session running, and quitting would
+        // take that session down with us -- which is exactly what a vterm bug
+        // used to do, silently, with exit code 0.
+        if self.terminal.reader_failed() && !self.terminal.is_process_exited() {
+            self.reader_failed_notice = true;
+            return false;
+        }
         self.terminal.is_process_exited()
+    }
+
+    /// The resume command for this session, so a user whose pane died can get
+    /// straight back in. Recovery, not prevention: this survives failures no
+    /// bound can catch, including SIGKILL.
+    pub fn resume_hint(&self) -> Option<String> {
+        let id = self.activity.session_id()?;
+        Some(format!("claude --resume {id}"))
     }
 
     /// Rebuild the tree OFF the event-loop thread, at most once per

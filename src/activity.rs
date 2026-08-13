@@ -186,6 +186,15 @@ impl ActivityWatcher {
         }
     }
 
+    /// The session id of the transcript being followed, if any. Used to build
+    /// the resume command shown when something goes wrong.
+    pub fn session_id(&self) -> Option<String> {
+        self.transcript
+            .as_ref()?
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+    }
+
     /// The transcript currently being followed, for diagnostics.
     #[allow(dead_code)]
     pub fn transcript_path(&self) -> Option<&Path> {

@@ -210,6 +210,17 @@ async fn main() -> Result<()> {
     restore_terminal();
     terminal.show_cursor()?;
 
+    // Recovery beats prevention. Claude sessions resume by id, so if anything
+    // went wrong -- our bug, a wedge, a signal -- the user gets straight back
+    // in instead of losing their work. This survives failure modes no bound
+    // can catch.
+    let abnormal = result.is_err() || app.reader_failed_notice;
+    if abnormal {
+        if let Some(cmd) = app.resume_hint() {
+            eprintln!("\nYour Claude session is still resumable:\n    {cmd}\n");
+        }
+    }
+
     if let Err(err) = result {
         eprintln!("Error: {err:?}");
         std::process::exit(1);

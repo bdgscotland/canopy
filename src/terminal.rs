@@ -11,15 +11,36 @@ use crate::vterm::VirtualTerminal;
 
 /// RAII guard that ensures the child process is waited on when dropped,
 /// preventing zombie processes even if the reader thread panics.
+/// How many emulator panics to absorb before giving up on the pane. The
+/// session outlives all of them either way.
+const MAX_VTERM_PANICS: u32 = 3;
+
+/// Reaps the child when the reader thread ends.
+///
+/// `child_exited` means the CHILD is gone, and only that. It used to mean "the
+/// reader thread stopped", which are not the same thing: any panic in the
+/// reader — a vterm indexing bug, a unicode edge case — set it, Canopy read it
+/// as "Claude quit", and exited 0. An unrelated bug in our own emulator ended
+/// the user's session, indistinguishably from a normal quit.
 struct ChildGuard {
     child: Box<dyn portable_pty::Child + Send>,
-    exited: Arc<AtomicBool>,
+    child_exited: Arc<AtomicBool>,
+    reader_failed: Arc<AtomicBool>,
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        self.exited.store(true, Ordering::SeqCst);
+        // Ask the OS, do not infer. If the child is still alive we are here
+        // because the READER died, and the session must survive that.
+        let really_gone = matches!(self.child.try_wait(), Ok(Some(_)));
+        if really_gone {
+            self.child_exited.store(true, Ordering::SeqCst);
+        } else {
+            self.reader_failed.store(true, Ordering::SeqCst);
+        }
         let _ = self.child.wait();
+        // wait() returning means it is gone now, whatever the reason.
+        self.child_exited.store(true, Ordering::SeqCst);
     }
 }
 
@@ -31,12 +52,22 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub struct TerminalPane {
-    pty_pair: Option<PtyPair>,
+    /// The MASTER only. The slave is dropped immediately after spawning the
+    /// child -- see try_spawn_claude. Holding it kept the PTY open against
+    /// ourselves: measured, with the parent still holding the slave, read() on
+    /// the master blocks forever even after the child exits, so the reader
+    /// thread never returns 0, ChildGuard never drops, and Canopy hangs at exit
+    /// instead of noticing Claude is gone. Dropping it turns every one of those
+    /// permanent hangs into an immediate EIO.
+    pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     pty_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     vterm: Arc<Mutex<VirtualTerminal>>,
     cwd: PathBuf,
     child_pid: Option<u32>,
     process_exited: Arc<AtomicBool>,
+    /// The reader thread stopped while the child was still alive. The pane is
+    /// frozen but the session is NOT gone; Canopy must not quit on this.
+    reader_failed: Arc<AtomicBool>,
     last_cols: u16,
     last_rows: u16,
     // Debounce: pending CWD change must be detected consistently before applying
@@ -50,15 +81,17 @@ impl TerminalPane {
     ) -> anyhow::Result<Self> {
         let vterm = Arc::new(Mutex::new(VirtualTerminal::new(80, 24)));
         let process_exited = Arc::new(AtomicBool::new(false));
+        let reader_failed = Arc::new(AtomicBool::new(false));
 
         let pty_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
 
         // Try to create PTY and spawn claude process
-        let (pty_pair, child_pid) = match Self::try_spawn_claude(
+        let (pty_master, child_pid) = match Self::try_spawn_claude(
             cwd,
             &vterm,
             claude_args,
             &process_exited,
+            &reader_failed,
             pty_tx,
             &pty_writer,
         ) {
@@ -77,12 +110,13 @@ impl TerminalPane {
         };
 
         Ok(Self {
-            pty_pair,
+            pty_master,
             pty_writer,
             vterm,
             cwd: cwd.to_path_buf(),
             child_pid,
             process_exited,
+            reader_failed,
             last_cols: 80,
             last_rows: 24,
         })
@@ -93,9 +127,10 @@ impl TerminalPane {
         vterm: &Arc<Mutex<VirtualTerminal>>,
         claude_args: &[String],
         process_exited: &Arc<AtomicBool>,
+        reader_failed: &Arc<AtomicBool>,
         pty_tx: mpsc::UnboundedSender<()>,
         pty_writer: &Arc<Mutex<Option<Box<dyn Write + Send>>>>,
-    ) -> anyhow::Result<(PtyPair, Option<u32>)> {
+    ) -> anyhow::Result<(Box<dyn portable_pty::MasterPty + Send>, Option<u32>)> {
         // Create PTY
         let pty_system = native_pty_system();
         let pty_pair = pty_system.openpty(PtySize {
@@ -140,38 +175,69 @@ impl TerminalPane {
         cmd.env_remove("CLAUDECODE");
 
         let child = pty_pair.slave.spawn_command(cmd)?;
+        // The child owns its own slave fd now; ours only keeps the PTY alive
+        // past the child's death.
+        let PtyPair { master, slave } = pty_pair;
+        drop(slave);
 
         // Get child PID before moving child into the thread
         let child_pid = child.process_id();
 
         // Take the writer from master PTY (can only be called once)
         // Store it in the shared Arc<Mutex<>> so both main thread and reader thread can use it
-        if let Ok(writer) = pty_pair.master.take_writer() {
+        if let Ok(writer) = master.take_writer() {
             *lock_or_recover(pty_writer) = Some(writer);
         }
 
         // Read output in background thread
-        let mut reader = pty_pair.master.try_clone_reader()?;
+        let mut reader = master.try_clone_reader()?;
         let vterm_clone = Arc::clone(vterm);
         let exited_clone = Arc::clone(process_exited);
+        let reader_failed_clone = Arc::clone(reader_failed);
         let writer_clone = Arc::clone(pty_writer);
 
         thread::spawn(move || {
             // ChildGuard ensures wait() is called even on panic
             let _guard = ChildGuard {
                 child,
-                exited: exited_clone,
+                child_exited: exited_clone,
+                reader_failed: reader_failed_clone,
             };
             let mut buf = [0u8; 4096];
+            let mut vterm_panics: u32 = 0;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let mut vt = lock_or_recover(&vterm_clone);
-                        vt.feed(&buf[..n]);
-                        // Flush any DSR/CPR responses back to the PTY
-                        let responses = vt.take_responses();
-                        drop(vt); // Release lock before I/O
+                        // The emulator is ~1,200 lines of hand-written escape
+                        // handling and has already produced five reachable
+                        // panics. A bug in it must never end the user's
+                        // session, so catch the unwind, reset the grid, and
+                        // keep reading. Budget a few per session: a permanently
+                        // panicking parser is a dead pane, not a live one.
+                        let feed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let mut vt = lock_or_recover(&vterm_clone);
+                            vt.feed(&buf[..n]);
+                            vt.take_responses()
+                        }));
+                        let responses = match feed {
+                            Ok(r) => r,
+                            Err(_) => {
+                                vterm_panics += 1;
+                                if vterm_panics > MAX_VTERM_PANICS {
+                                    // Stop feeding, but leave the child alone.
+                                    // ChildGuard will report reader_failed, and
+                                    // the session keeps running.
+                                    break;
+                                }
+                                // Poisoned by the unwind; recover and reset to
+                                // a clean grid at the current geometry.
+                                let mut vt = lock_or_recover(&vterm_clone);
+                                let (c, r) = (vt.cols(), vt.rows());
+                                vt.reset_after_panic(c, r);
+                                Vec::new()
+                            }
+                        };
                         if !responses.is_empty() {
                             if let Ok(mut guard) = writer_clone.lock() {
                                 if let Some(ref mut writer) = *guard {
@@ -193,7 +259,7 @@ impl TerminalPane {
             // ChildGuard::drop will set exited flag and wait for child
         });
 
-        Ok((pty_pair, child_pid))
+        Ok((master, child_pid))
     }
 
     pub fn cwd(&self) -> &Path {
@@ -247,6 +313,13 @@ impl TerminalPane {
 
     pub fn is_process_exited(&self) -> bool {
         self.process_exited.load(Ordering::SeqCst)
+    }
+
+    /// The reader thread died but the child is still running. The pane is dead;
+    /// the session is not. Canopy stays up so the user can read the message and
+    /// copy their resume command.
+    pub fn reader_failed(&self) -> bool {
+        self.reader_failed.load(Ordering::SeqCst)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -673,8 +746,8 @@ impl TerminalPane {
         self.last_rows = rows;
 
         // Resize the PTY
-        if let Some(ref pty_pair) = self.pty_pair {
-            let _ = pty_pair.master.resize(PtySize {
+        if let Some(ref master) = self.pty_master {
+            let _ = master.resize(PtySize {
                 rows,
                 cols,
                 pixel_width: 0,
@@ -689,8 +762,8 @@ impl TerminalPane {
 
 impl Drop for TerminalPane {
     fn drop(&mut self) {
-        // PTY will be cleaned up automatically
-        self.pty_pair.take();
+        // Closing the master sends SIGHUP to the child.
+        self.pty_master.take();
     }
 }
 

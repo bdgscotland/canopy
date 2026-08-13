@@ -155,7 +155,10 @@ fn restore_terminal() {
 /// Whether we have already entered raw/alternate-screen mode.
 static TERMINAL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-#[tokio::main]
+// A TUI with a single async event loop. The default multi-threaded runtime
+// spawns one worker per core (18 threads on this machine, seen in a sample)
+// to serve one select! loop.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = parse_args();
 

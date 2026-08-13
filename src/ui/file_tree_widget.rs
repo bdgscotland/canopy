@@ -86,8 +86,7 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
             }
 
             let tree_style = Style::default().fg(Color::DarkGray);
-            let node_style = if let Some(kind) = active {
-                let bg = active_bg.unwrap();
+            let node_style = if let (Some(kind), Some(bg)) = (active, active_bg) {
                 match kind {
                     ActivityKind::Write => Style::default()
                         .bg(bg)

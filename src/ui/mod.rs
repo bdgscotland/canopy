@@ -90,14 +90,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // File tree pane (right side)
     let tree_area = chunks[1];
 
-    let tree_title = format!(
-        " {} ",
-        app.tree
-            .root_path()
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| app.tree.root_path().to_string_lossy().to_string())
-    );
+    let tree_name = app
+        .tree
+        .root_path()
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| app.tree.root_path().to_string_lossy().to_string());
+    // A rescan in progress is a hint in the title, not a blank pane.
+    let tree_title = if app.tree_loading && !app.tree.nodes().is_empty() {
+        format!(" {tree_name} · rescanning ")
+    } else {
+        format!(" {tree_name} ")
+    };
 
     let tree_block = Block::default()
         .title(tree_title)
@@ -111,7 +115,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Store tree area for mouse scroll routing
     app.tree_area = Some(tree_inner);
 
-    if app.tree_loading {
+    // A rescan ANNOTATES the tree, it never replaces it. Blanking the pane to
+    // say "scanning" throws away the perfectly good tree the user was reading,
+    // for work that usually finishes in tens of milliseconds.
+    if app.tree_loading && app.tree.nodes().is_empty() {
         let loading =
             Paragraph::new("  Scanning files...").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(loading, tree_inner);

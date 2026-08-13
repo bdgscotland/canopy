@@ -92,7 +92,10 @@ impl App {
             tree,
             terminal,
             tree_width_percent: tree_width.clamp(10, 50),
-            tree_loading: true,
+            // FileTree::new already walked synchronously above, so the tree is
+            // populated. Starting this true left "Scanning files..." on screen
+            // forever, because nothing spawns a walk at startup to clear it.
+            tree_loading: false,
             tree_area: None,
             terminal_area: None,
             selection: None,
@@ -397,5 +400,46 @@ fn try_clipboard_cmd(program: &str, args: &[&str], text: &str) -> bool {
             child.wait().map(|s| s.success()).unwrap_or(false)
         }
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod loading_state_tests {
+    /// The startup value of `tree_loading` must match reality: FileTree::new
+    /// walks synchronously in the constructor, so the tree IS populated by the
+    /// time the first frame renders. Starting it true left "Scanning files..."
+    /// on screen forever, because nothing spawns a walk at startup to clear it,
+    /// and the loading branch REPLACED the tree instead of annotating it.
+    ///
+    /// This asserts the constructor's literal rather than building an App,
+    /// which would need a PTY and a live child.
+    #[test]
+    fn tree_loading_starts_false_because_the_constructor_already_walked() {
+        let src = include_str!("app.rs");
+        let ctor = src
+            .split("Ok(Self {")
+            .nth(1)
+            .expect("App::new struct literal");
+        assert!(
+            ctor.contains("tree_loading: false"),
+            "tree_loading must start false: FileTree::new already walked, and \
+             nothing clears it at startup"
+        );
+    }
+
+    /// The tree must never be blanked for a rescan that usually takes tens of
+    /// milliseconds. Loading annotates the title; only a genuinely empty tree
+    /// shows the placeholder.
+    #[test]
+    fn a_rescan_annotates_the_tree_instead_of_replacing_it() {
+        let ui = include_str!("ui/mod.rs");
+        assert!(
+            ui.contains("app.tree_loading && app.tree.nodes().is_empty()"),
+            "the loading placeholder must be gated on an EMPTY tree"
+        );
+        assert!(
+            ui.contains("rescanning"),
+            "a rescan should be visible in the title, not by blanking the pane"
+        );
     }
 }

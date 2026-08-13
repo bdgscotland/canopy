@@ -37,6 +37,7 @@ pub struct App {
     pending_reveal: Option<PathBuf>,
     last_refresh: Instant,
     refresh_queued: bool,
+    reveal_attempts: u8,
 }
 
 impl App {
@@ -50,9 +51,17 @@ impl App {
     ) -> Result<Self> {
         let canonical_path = path.canonicalize().unwrap_or(path);
 
+        // Open the PTY FIRST. Rust evaluates struct fields in source order, so
+        // building the tree here meant Claude did not start until the walk
+        // finished -- 443 ms on a 20k-node repo before the walk was rewritten,
+        // and still non-zero on a cold cache. Claude's startup is the thing the
+        // user is waiting for; the tree can arrive a few milliseconds later.
+        let terminal = TerminalPane::new(&canonical_path, &claude_args, pty_tx)?;
+        let tree = FileTree::new(&canonical_path, show_hidden, max_depth)?;
+
         Ok(Self {
-            tree: FileTree::new(&canonical_path, show_hidden, max_depth)?,
-            terminal: TerminalPane::new(&canonical_path, &claude_args, pty_tx)?,
+            tree,
+            terminal,
             tree_width_percent: tree_width.clamp(10, 50),
             tree_loading: true,
             tree_area: None,
@@ -64,6 +73,7 @@ impl App {
             pending_reveal: None,
             last_refresh: Instant::now(),
             refresh_queued: false,
+            reveal_attempts: 0,
         })
     }
 
@@ -118,10 +128,18 @@ impl App {
     fn poll_activity(&mut self) {
         let visible = self.tree_area.map(|a| a.height as usize).unwrap_or(0);
 
-        // A path we could not show last tick: the tree has since been
-        // refreshed by the file watcher, so try once more.
+        // A path we could not show last tick. The retry was previously
+        // guaranteed to fail: pending_reveal is only set when the throttle
+        // blocked the rebuild, and the retry ran before the rebuild happened.
+        // Keep it pending, and keep asking for the rebuild, until it lands.
         if let Some(path) = self.pending_reveal.take() {
-            self.tree.reveal(&path, visible);
+            if self.tree.reveal(&path, visible) {
+                self.reveal_attempts = 0;
+            } else if self.reveal_attempts < 10 {
+                self.reveal_attempts += 1;
+                self.request_refresh();
+                self.pending_reveal = Some(path);
+            }
         }
 
         let events = self.activity.poll();
@@ -132,11 +150,16 @@ impl App {
         self.highlight = Some((latest.path.clone(), latest.kind));
 
         if !self.tree.reveal(&latest.path, visible) {
-            // Not in the tree yet. Claude most likely just created it; rebuild
-            // and retry on a later tick once the walk has settled.
+            // A rebuild is only worth it if the path COULD appear. Without this
+            // test, every tool-use on a hidden or ignored file cost a full walk.
+            if self.tree.can_never_show(&latest.path) {
+                return;
+            }
+            // Claude most likely just created it; rebuild and retry.
             self.request_refresh();
             if !self.tree.reveal(&latest.path, visible) {
                 self.pending_reveal = Some(latest.path.clone());
+                self.reveal_attempts = 0;
             }
         }
     }

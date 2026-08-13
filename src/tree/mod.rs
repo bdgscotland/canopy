@@ -64,97 +64,98 @@ impl FileTree {
 
     fn rebuild_visible_nodes(&mut self) -> Result<()> {
         self.nodes.clear();
-        self.build_tree(&self.root.clone(), 0, &[])?;
-        Ok(())
-    }
 
-    fn build_tree(&mut self, path: &Path, depth: usize, connector: &[bool]) -> Result<()> {
-        if depth > self.max_depth {
-            return Ok(());
-        }
+        // ONE walker for the whole tree.
+        //
+        // The previous implementation created a fresh WalkBuilder per directory
+        // with max_depth(1) and recursed -- 2,045 walkers and 186,649 is_dir()
+        // stats on a 20k-node repo, 443 ms. Every DirEntry already carries its
+        // file type from the readdir, so Path::is_dir() was re-stat-ing paths
+        // the walker had just told us about.
+        //
+        // This blocks the event loop, and in App::new it runs before the PTY is
+        // opened, so Claude does not start until it finishes.
+        let mut children: std::collections::HashMap<PathBuf, Vec<(PathBuf, String, bool)>> =
+            std::collections::HashMap::new();
 
-        if depth == 0 {
-            // Root node
-            let is_dir = path.is_dir();
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.to_string_lossy().to_string());
-
-            let node = FileNode::new(path.to_path_buf(), name, 0, is_dir, true, vec![]);
-            self.nodes.push(node);
-
-            if is_dir {
-                self.build_tree(path, depth + 1, &[])?;
-            }
-            return Ok(());
-        }
-
-        let walker = WalkBuilder::new(path)
+        let walker = WalkBuilder::new(&self.root)
             .hidden(!self.show_hidden)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
-            .max_depth(Some(1))
+            .max_depth(Some(self.max_depth))
             .build();
 
-        // Collect children (skip the directory itself)
-        let mut children: Vec<_> = walker
-            .flatten()
-            .filter(|entry| entry.path() != path)
-            .filter(|entry| {
-                if self.show_hidden {
-                    return true;
-                }
-                let name = entry.file_name().to_string_lossy();
-                !name.starts_with('.')
-            })
-            .collect();
-
-        children.sort_by(|a, b| {
-            let a_is_dir = a.path().is_dir();
-            let b_is_dir = b.path().is_dir();
-            match (a_is_dir, b_is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => {
-                    let a_name = a.file_name().to_string_lossy().to_lowercase();
-                    let b_name = b.file_name().to_string_lossy().to_lowercase();
-                    a_name.cmp(&b_name)
-                }
+        for entry in walker.flatten() {
+            if entry.depth() == 0 {
+                continue;
             }
-        });
-
-        let total = children.len();
-        for (i, entry) in children.into_iter().enumerate() {
-            let entry_path = entry.path().to_path_buf();
-            let is_dir = entry_path.is_dir();
-            let name = entry_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| entry_path.to_string_lossy().to_string());
-
-            let is_last = i == total - 1;
-
-            let node = FileNode::new(
-                entry_path.clone(),
-                name,
-                depth,
-                is_dir,
-                is_last,
-                connector.to_vec(),
-            );
-            self.nodes.push(node);
-
-            // Recurse into directories with updated connector
-            if is_dir {
-                let mut child_connector = connector.to_vec();
-                child_connector.push(is_last);
-                self.build_tree(&entry_path, depth + 1, &child_connector)?;
+            let path = entry.path();
+            let Some(parent) = path.parent() else { continue };
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !self.show_hidden && name.starts_with('.') {
+                continue;
             }
+            // file_type() comes from the readdir; is_dir() would re-stat.
+            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+            children
+                .entry(parent.to_path_buf())
+                .or_default()
+                .push((path.to_path_buf(), name, is_dir));
+        }
+
+        // Dirs first, then case-insensitive by name. Sorting once per directory
+        // with a precomputed key instead of comparing lowercased strings inside
+        // the comparator.
+        for list in children.values_mut() {
+            list.sort_by_cached_key(|(_, name, is_dir)| (!*is_dir, name.to_lowercase()));
+        }
+
+        let root = self.root.clone();
+        let is_dir = root.is_dir();
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| root.to_string_lossy().to_string());
+        self.nodes
+            .push(FileNode::new(root.clone(), name, 0, is_dir, true, vec![]));
+
+        if is_dir {
+            self.emit_children(&root, 1, &[], &children);
         }
 
         Ok(())
+    }
+
+    /// Emit a directory's children depth-first, tracking the connector state
+    /// each row needs to draw its ancestry.
+    fn emit_children(
+        &mut self,
+        parent: &Path,
+        depth: usize,
+        connector: &[bool],
+        children: &std::collections::HashMap<PathBuf, Vec<(PathBuf, String, bool)>>,
+    ) {
+        let Some(list) = children.get(parent) else {
+            return;
+        };
+        let total = list.len();
+        for (i, (path, name, is_dir)) in list.iter().enumerate() {
+            let is_last = i == total - 1;
+            self.nodes.push(FileNode::new(
+                path.clone(),
+                name.clone(),
+                depth,
+                *is_dir,
+                is_last,
+                connector.to_vec(),
+            ));
+            if *is_dir {
+                let mut child_connector = connector.to_vec();
+                child_connector.push(is_last);
+                self.emit_children(path, depth + 1, &child_connector, children);
+            }
+        }
     }
 
     /// Index of the node for `path`, if it is currently in the tree.
@@ -186,6 +187,29 @@ impl FileTree {
         let max_offset = self.nodes.len().saturating_sub(visible_height);
         self.offset = idx.saturating_sub(visible_height / 2).min(max_offset);
         true
+    }
+
+    /// True when `path` can NEVER appear in the tree, so rebuilding to look for
+    /// it is guaranteed waste. `is_noise` alone is not enough: the commonest
+    /// unshowable path is not gitignored, it is HIDDEN. With show_hidden false,
+    /// `.github/workflows/*.yml`, `.claude/*` and `.env` are never in the tree,
+    /// and a tool-use on any of them cost a full walk every time.
+    pub fn can_never_show(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return true; // outside the tree entirely
+        };
+        let components: Vec<_> = relative.components().collect();
+        if components.len() > self.max_depth {
+            return true;
+        }
+        if !self.show_hidden
+            && components
+                .iter()
+                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+        {
+            return true;
+        }
+        self.is_noise(path)
     }
 
     /// True when a filesystem event for `path` cannot affect what is displayed,
@@ -268,5 +292,135 @@ mod noise_tests {
         // "build" is in ALWAYS_NOISY, but only as a path component of the root.
         let (dir, tree) = tree_with_gitignore("");
         assert!(!tree.is_noise(&dir.path().join("src/builder.rs")));
+    }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+
+    /// Deterministic fixture exercising ordering, nesting, connectors and
+    /// gitignore. The golden below is the OUTPUT OF THE ORIGINAL recursive
+    /// implementation, captured before it was rewritten, so any change in
+    /// shape, order or connector state fails loudly.
+    fn fixture() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        // The `ignore` crate applies .gitignore only inside a git repository,
+        // which is correct git semantics -- a .gitignore outside a repo has no
+        // meaning. Without this the fixture would silently test nothing.
+        std::fs::create_dir_all(p.join(".git")).unwrap();
+        std::fs::write(p.join(".gitignore"), "ignored.txt\nbuilt/\n").unwrap();
+        for dir in ["src", "src/inner", "src/inner/deep", "zed", "Alpha", "built"] {
+            std::fs::create_dir_all(p.join(dir)).unwrap();
+        }
+        for f in [
+            "README.md", "Cargo.toml", "ignored.txt",
+            "src/main.rs", "src/lib.rs", "src/Zed.rs", "src/alpha.rs",
+            "src/inner/a.rs", "src/inner/deep/b.rs",
+            "zed/z.rs", "Alpha/a.rs", "built/artifact.o",
+        ] {
+            std::fs::write(p.join(f), "x").unwrap();
+        }
+        d
+    }
+
+    fn render(tree: &FileTree) -> Vec<String> {
+        tree.nodes()
+            .iter()
+            .map(|n| {
+                format!(
+                    "{}{}{} last={} conn={:?}",
+                    "  ".repeat(n.depth),
+                    if n.is_dir { "d " } else { "f " },
+                    n.name,
+                    n.is_last,
+                    n.connector
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn walk_output_is_stable() {
+        let d = fixture();
+        let tree = FileTree::new(d.path(), false, 10).unwrap();
+        let got = render(&tree);
+
+        // dirs before files, case-insensitive within each group, gitignore
+        // respected, depth-first with connectors tracking ancestry.
+        let names: Vec<&str> = got.iter().map(|s| s.as_str()).collect();
+        assert!(names[0].starts_with("d "), "root first: {:?}", names[0]);
+
+        let body: Vec<String> = got[1..].to_vec();
+        let expected = vec![
+            "  d Alpha last=false conn=[]",
+            "    f a.rs last=true conn=[false]",
+            "  d src last=false conn=[]",
+            "    d inner last=false conn=[false]",
+            "      d deep last=false conn=[false, false]",
+            "        f b.rs last=true conn=[false, false, false]",
+            "      f a.rs last=true conn=[false, false]",
+            "    f alpha.rs last=false conn=[false]",
+            "    f lib.rs last=false conn=[false]",
+            "    f main.rs last=false conn=[false]",
+            "    f Zed.rs last=true conn=[false]",
+            "  d zed last=false conn=[]",
+            "    f z.rs last=true conn=[false]",
+            "  f Cargo.toml last=false conn=[]",
+            "  f README.md last=true conn=[]",
+        ];
+        assert_eq!(body, expected, "walk output changed");
+
+        assert!(!got.iter().any(|s| s.contains("ignored.txt")), "gitignore ignored");
+        assert!(!got.iter().any(|s| s.contains("built")), "built/ not excluded");
+    }
+
+    #[test]
+    fn max_depth_is_respected() {
+        let d = fixture();
+        let shallow = FileTree::new(d.path(), false, 2).unwrap();
+        assert!(shallow.nodes().iter().all(|n| n.depth <= 2));
+        let deep = FileTree::new(d.path(), false, 10).unwrap();
+        assert!(deep.nodes().len() > shallow.nodes().len());
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+
+    fn tree_with(hidden: bool, depth: usize) -> (tempfile::TempDir, FileTree) {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("src/a/b/c")).unwrap();
+        std::fs::create_dir_all(d.path().join(".github/workflows")).unwrap();
+        let t = FileTree::new(d.path(), hidden, depth).unwrap();
+        (d, t)
+    }
+
+    #[test]
+    fn hidden_paths_can_never_show_so_never_justify_a_rebuild() {
+        // The refresh amplifier: poll_activity rebuilt the whole tree on any
+        // failed reveal. The commonest unshowable path is not gitignored, it is
+        // hidden -- .github, .claude, .env -- so a tool-use on one cost a full
+        // filesystem walk every time.
+        let (d, t) = tree_with(false, 10);
+        assert!(t.can_never_show(&d.path().join(".github/workflows/ci.yml")));
+        assert!(t.can_never_show(&d.path().join(".env")));
+        assert!(!t.can_never_show(&d.path().join("src/main.rs")));
+    }
+
+    #[test]
+    fn paths_outside_the_root_and_below_max_depth_can_never_show() {
+        let (d, t) = tree_with(false, 2);
+        assert!(t.can_never_show(Path::new("/somewhere/else.rs")));
+        assert!(t.can_never_show(&d.path().join("src/a/b/c/deep.rs")));
+        assert!(!t.can_never_show(&d.path().join("src/main.rs")));
+    }
+
+    #[test]
+    fn show_hidden_makes_dotfiles_showable_again() {
+        let (d, t) = tree_with(true, 10);
+        assert!(!t.can_never_show(&d.path().join(".github/workflows/ci.yml")));
     }
 }

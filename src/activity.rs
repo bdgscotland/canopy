@@ -47,19 +47,83 @@ pub struct Activity {
 }
 
 /// Claude Code mangles a project path into a directory name by replacing every
-/// path separator with `-`. `/Users/me/proj` becomes `-Users-me-proj`.
+/// character that is not `[a-zA-Z0-9]` with `-` — not just the separators.
+/// Extracted from the shipped binary (2.1.231):
+///
+/// ```js
+/// function zmo(e){ return e.replace(/[^a-zA-Z0-9]/g,"-") }
+/// ```
+///
+/// So `/Users/me/my_proj-v1.2` becomes `-Users-me-my-proj-v1-2`. Mapping only
+/// the separators produces a directory that does not exist, and discovery then
+/// fails silently for the whole session.
+///
+/// Claude also truncates names over a length limit and appends a hash of an
+/// internal, non-portable function. We deliberately do not reimplement that —
+/// `find_by_cwd` covers truncation, `CLAUDE_CONFIG_DIR`, and any future change
+/// to the scheme with one mechanism.
 fn mangle_project_path(root: &Path) -> String {
-    let s = root.to_string_lossy();
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        out.push(if ch == '/' || ch == '\\' { '-' } else { ch });
+    root.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Claude Code resolves its config root as `CLAUDE_CONFIG_DIR ?? ~/.claude`.
+fn config_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
     }
-    out
+    Some(dirs::home_dir()?.join(".claude"))
 }
 
 fn projects_dir(root: &Path) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(home.join(".claude/projects").join(mangle_project_path(root)))
+    Some(config_dir()?.join("projects").join(mangle_project_path(root)))
+}
+
+/// Fallback when the mangled directory does not exist: scan every project
+/// directory for the most recently modified transcript whose first line reports
+/// this `cwd`. Covers Claude's name truncation, a changed mangling scheme, and
+/// any case our reimplementation gets wrong.
+fn find_by_cwd(root: &Path) -> Option<PathBuf> {
+    let projects = config_dir()?.join("projects");
+    let want = root.to_string_lossy();
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+
+    for project in std::fs::read_dir(projects).ok()?.flatten() {
+        let Ok(entries) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            if best.as_ref().is_some_and(|(t, _)| modified <= *t) {
+                continue;
+            }
+            // Only the first line is read, so this stays cheap even though some
+            // transcripts are megabytes.
+            let Ok(file) = File::open(&path) else { continue };
+            let mut first = String::new();
+            if BufReader::new(file).read_line(&mut first).is_err() {
+                continue;
+            }
+            let matches = serde_json::from_str::<serde_json::Value>(&first)
+                .ok()
+                .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(String::from))
+                .is_some_and(|cwd| cwd == want);
+            if matches {
+                best = Some((modified, path));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// Tails the transcript of the Claude session working in `root`.
@@ -73,6 +137,9 @@ pub struct ActivityWatcher {
     pinned_session: Option<String>,
     last_poll: Instant,
     last_discovery: Instant,
+    /// Why no transcript is being followed, for diagnostics. Discovery failing
+    /// silently is half of what made the mangling bug invisible.
+    no_transcript_reason: Option<String>,
 }
 
 /// How often to look for new transcript bytes. Reading from a stored offset is
@@ -98,6 +165,7 @@ impl ActivityWatcher {
             pinned_session,
             last_poll: stale,
             last_discovery: stale,
+            no_transcript_reason: None,
         };
         w.discover();
         w
@@ -135,6 +203,7 @@ impl ActivityWatcher {
             pinned_session: None,
             last_poll: stale,
             last_discovery: Instant::now(),
+            no_transcript_reason: None,
         }
     }
 
@@ -156,6 +225,14 @@ impl ActivityWatcher {
         }
 
         let Ok(entries) = std::fs::read_dir(&dir) else {
+            // The mangled name did not resolve. Fall back to matching on the
+            // `cwd` recorded inside the transcripts themselves.
+            if let Some(path) = find_by_cwd(&self.root) {
+                self.adopt(path);
+            } else {
+                self.no_transcript_reason =
+                    Some(format!("no transcript directory at {}", dir.display()));
+            }
             return;
         };
 
@@ -177,12 +254,30 @@ impl ActivityWatcher {
             if Some(path.as_path()) != self.transcript.as_deref() {
                 self.adopt(path);
             }
+        } else if self.transcript.is_none() {
+            if let Some(path) = find_by_cwd(&self.root) {
+                self.adopt(path);
+            } else {
+                self.no_transcript_reason =
+                    Some(format!("no transcript found for {}", self.root.display()));
+            }
         }
     }
 
     /// Follow `path`, starting at its current end. Existing content is history,
     /// not activity, so we never replay it.
+    /// Why nothing is being followed, if nothing is.
+    #[allow(dead_code)]
+    pub fn no_transcript_reason(&self) -> Option<&str> {
+        if self.transcript.is_some() {
+            None
+        } else {
+            self.no_transcript_reason.as_deref()
+        }
+    }
+
     fn adopt(&mut self, path: PathBuf) {
+        self.no_transcript_reason = None;
         self.offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         self.transcript = Some(path);
     }
@@ -310,10 +405,40 @@ mod tests {
 
     #[test]
     fn mangles_project_path_like_claude_does() {
+        // Claude Code 2.1.231, extracted from the binary:
+        //   function zmo(e){ return e.replace(/[^a-zA-Z0-9]/g,"-") }
+        // The previous version of this test used an all-alphanumeric path, so
+        // it passed while the implementation only mapped separators. Every
+        // non-alphanumeric character must map.
         assert_eq!(
             mangle_project_path(Path::new("/Users/me/Developer/canopy")),
             "-Users-me-Developer-canopy"
         );
+        assert_eq!(
+            mangle_project_path(Path::new("/Users/me/Developer/fs-uae-3.2.35")),
+            "-Users-me-Developer-fs-uae-3-2-35"
+        );
+        assert_eq!(
+            mangle_project_path(Path::new("/Users/me/_scratch/my proj")),
+            "-Users-me--scratch-my-proj"
+        );
+        assert_eq!(
+            mangle_project_path(Path::new("/tmp/a@b.c")),
+            "-tmp-a-b-c"
+        );
+    }
+
+    #[test]
+    fn config_dir_honours_claude_config_dir() {
+        // Claude resolves CLAUDE_CONFIG_DIR ?? ~/.claude. Hardcoding ~/.claude
+        // sends discovery to a directory that does not exist for anyone who
+        // sets it.
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test, restored immediately after.
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", dir.path()) };
+        let got = config_dir().unwrap();
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        assert_eq!(got, dir.path());
     }
 
     #[test]

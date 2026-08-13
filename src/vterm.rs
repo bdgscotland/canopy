@@ -490,6 +490,13 @@ impl VirtualTerminal {
     }
 
     fn erase_in_display(&mut self, mode: u16) {
+        // Every sibling erase/insert/delete method has this prologue; this one
+        // did not, and ED at 0 rows or with a stale cursor panicked the PTY
+        // reader thread — which sets process_exited and quits Canopy outright,
+        // taking the live Claude session with it.
+        if self.rows == 0 || self.cols == 0 || self.cursor.y >= self.rows {
+            return;
+        }
         match mode {
             // Erase from cursor to end of screen
             0 => {
@@ -524,7 +531,9 @@ impl VirtualTerminal {
     }
 
     fn erase_in_line(&mut self, mode: u16) {
-        if self.cursor.y >= self.rows {
+        // cols == 0 matters as well as rows: mode 1 uses an inclusive range
+        // `0..=x.min(cols-1)`, which still visits column 0 of an empty row.
+        if self.rows == 0 || self.cols == 0 || self.cursor.y >= self.rows {
             return;
         }
         match mode {
@@ -640,8 +649,15 @@ fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        // Operate on bytes throughout. Slicing `input` by byte offsets panics
+        // when the offset lands inside a multi-byte character, and OSC 7 URIs
+        // can legitimately contain one (file://h/a%<U+20AC>b).
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(val) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
+            let hex = [bytes[i + 1], bytes[i + 2]];
+            if let Some(val) = std::str::from_utf8(&hex)
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
                 result.push(val);
                 i += 3;
                 continue;
@@ -938,10 +954,17 @@ impl Perform for VirtualTerminal {
             // DECSTBM - Set Scrolling Region (top;bottom)
             'r' => {
                 if intermediates.is_empty() {
+                    if self.rows == 0 {
+                        return;
+                    }
                     let top = p.first().copied().unwrap_or(1).max(1) as usize - 1;
                     let bottom = p.get(1).copied().unwrap_or(self.rows as u16) as usize;
-                    self.scroll_top = top.min(self.rows);
-                    self.scroll_bottom = bottom.min(self.rows).max(self.scroll_top + 1);
+                    // top must leave room for at least one row below it.
+                    // Clamping to `rows` (not `rows - 1`) let scroll_bottom be
+                    // forced to rows + 1 by the .max() below, and scroll_up /
+                    // scroll_down then indexed one past the grid.
+                    self.scroll_top = top.min(self.rows - 1);
+                    self.scroll_bottom = bottom.clamp(self.scroll_top + 1, self.rows);
                     // DECSTBM resets cursor to home
                     self.cursor.x = 0;
                     self.cursor.y = 0;
@@ -1273,6 +1296,69 @@ mod tests {
                    "colon-form truecolor must be parsed");
         assert!(x.style.add_modifier.contains(ratatui::style::Modifier::BOLD),
                 "the parameter after a colon-form colour must not be swallowed");
+    }
+
+    /// The invariant every grid-mutating path must preserve. Indices were being
+    /// validated against `self.rows`/`self.cols` while nothing guaranteed the
+    /// grid actually had those dimensions.
+    fn assert_grid_shape(vt: &VirtualTerminal, ctx: &str) {
+        assert_eq!(vt.grid().len(), vt.rows(), "row count wrong after {ctx}");
+        for (i, row) in vt.grid().iter().enumerate() {
+            assert_eq!(row.len(), vt.cols(), "row {i} width wrong after {ctx}");
+        }
+    }
+
+    #[test]
+    fn every_scroll_region_survives_scrolling() {
+        // 66 of these panicked: DECSTBM clamped top to `rows` instead of
+        // `rows - 1`, so scroll_bottom was forced to rows + 1 and scroll_up /
+        // scroll_down indexed one past the grid. On the PTY reader thread that
+        // is a crash that takes the Claude session with it.
+        const ROWS: usize = 30;
+        for top in 0..=ROWS + 2 {
+            for bottom in 0..=ROWS + 2 {
+                let mut vt = VirtualTerminal::new(80, ROWS);
+                vt.feed(format!("\x1b[{top};{bottom}r").as_bytes());
+                for _ in 0..ROWS + 5 {
+                    vt.feed(b"\n");
+                }
+                vt.feed(b"\x1bM\x1bM");
+                vt.feed(b"\x1b[S\x1b[T");
+                assert_grid_shape(&vt, &format!("ESC[{top};{bottom}r"));
+            }
+        }
+    }
+
+    #[test]
+    fn degenerate_geometry_survives_every_erase_and_edit() {
+        // rows == 0 is reachable in the real app: ui/mod.rs sizes the vterm to
+        // Block::inner() every frame, so a 2-row-tall window yields zero rows.
+        for (cols, rows) in [(0usize, 24usize), (78, 0), (0, 0), (1, 1)] {
+            for seq in [
+                &b"\x1b[J"[..], b"\x1b[1J", b"\x1b[2J", b"\x1b[3J",
+                b"\x1b[K", b"\x1b[1K", b"\x1b[2K",
+                b"\x1b[P", b"\x1b[@", b"\x1b[X", b"\x1b[L", b"\x1b[M",
+                b"\x1b[S", b"\x1b[T", b"\x1bM", b"\x1bD",
+                b"\x1b[1;1H", b"\x1b[99;99H", b"\x1b[999X", b"\x1b[r",
+            ] {
+                let mut vt = VirtualTerminal::new(cols, rows);
+                vt.feed(seq);
+                vt.feed(b"A");
+                assert_grid_shape(&vt, &format!("{cols}x{rows} {seq:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn osc7_percent_decode_handles_multibyte() {
+        // Slicing a &str by byte offsets panics when the offset lands inside a
+        // multi-byte character, and an OSC 7 URI can contain one.
+        let mut vt = VirtualTerminal::new(80, 24);
+        vt.feed("\x1b]7;file://h/a%\u{20AC}b\x07".as_bytes());
+        vt.feed("\x1b]7;file://h/%E2%82%AC\x07".as_bytes());
+        vt.feed(b"\x1b]7;file://h/trailing%\x07");
+        vt.feed(b"\x1b]7;file://h/short%A\x07");
+        assert_grid_shape(&vt, "osc7 percent decoding");
     }
 
     #[test]

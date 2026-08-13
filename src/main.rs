@@ -1,3 +1,4 @@
+mod activity;
 mod app;
 mod event;
 mod terminal;

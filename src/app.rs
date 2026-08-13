@@ -4,6 +4,7 @@ use ratatui::prelude::Rect;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
+use crate::activity::{ActivityKind, ActivityWatcher};
 use crate::terminal::TerminalPane;
 use crate::tree::FileTree;
 
@@ -21,6 +22,14 @@ pub struct App {
     pub terminal_area: Option<Rect>,
     pub selection: Option<Selection>,
     pub last_auto_scroll_cwd: Option<PathBuf>,
+    /// Follows Claude's session transcript.
+    pub activity: ActivityWatcher,
+    /// The file Claude touched most recently, and how. Persists until the next
+    /// event supersedes it — no fade timer, so nothing runs while idle.
+    pub highlight: Option<(PathBuf, ActivityKind)>,
+    /// Set when a revealed path was not in the tree, so the next tick rebuilds
+    /// and retries. Claude creating a file is the common case.
+    pending_reveal: Option<PathBuf>,
 }
 
 impl App {
@@ -43,18 +52,24 @@ impl App {
             terminal_area: None,
             selection: None,
             last_auto_scroll_cwd: None,
+            activity: ActivityWatcher::new(&canonical_path, std::env::var("CANOPY_SESSION_ID").ok()),
+            highlight: None,
+            pending_reveal: None,
         })
     }
 
     pub fn tick(&mut self) -> bool {
         self.terminal.tick();
 
-        // CWD가 트리 루트 밖이면 트리 루트 갱신
+        // If the CWD leaves the tree root, re-root the tree there.
         let cwd = self.terminal.cwd().to_path_buf();
         if !cwd.starts_with(self.tree.root_path()) {
-            self.tree.set_root(cwd);
+            self.tree.set_root(cwd.clone());
+            self.activity.set_root(cwd);
             self.last_auto_scroll_cwd = None;
         }
+
+        self.poll_activity();
 
         // Process clipboard requests from vterm (OSC 52)
         {
@@ -67,6 +82,33 @@ impl App {
             self.tree_loading = false;
         }
         self.terminal.is_process_exited()
+    }
+
+    /// Pull anything Claude has done since the last tick and follow it.
+    fn poll_activity(&mut self) {
+        let visible = self.tree_area.map(|a| a.height as usize).unwrap_or(0);
+
+        // A path we could not show last tick: the tree has since been
+        // refreshed by the file watcher, so try once more.
+        if let Some(path) = self.pending_reveal.take() {
+            self.tree.reveal(&path, visible);
+        }
+
+        let events = self.activity.poll();
+        let Some(latest) = events.last() else {
+            return;
+        };
+
+        self.highlight = Some((latest.path.clone(), latest.kind));
+
+        if !self.tree.reveal(&latest.path, visible) {
+            // Not in the tree yet. Claude most likely just created it; rebuild
+            // now and retry on the next tick once the walk has settled.
+            self.tree.refresh();
+            if !self.tree.reveal(&latest.path, visible) {
+                self.pending_reveal = Some(latest.path.clone());
+            }
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {

@@ -3,16 +3,28 @@ use std::path::Path;
 use ratatui::{prelude::*, widgets::StatefulWidget};
 
 use super::FileTreeWidgetState;
+use crate::activity::ActivityKind;
 use crate::tree::FileTree;
 
 pub struct FileTreeWidget<'a> {
     tree: &'a FileTree,
     cwd: Option<&'a Path>,
+    /// The file Claude last touched, and how.
+    highlight: Option<(&'a Path, ActivityKind)>,
 }
 
 impl<'a> FileTreeWidget<'a> {
     pub fn new(tree: &'a FileTree, cwd: Option<&'a Path>) -> Self {
-        Self { tree, cwd }
+        Self {
+            tree,
+            cwd,
+            highlight: None,
+        }
+    }
+
+    pub fn highlight(mut self, highlight: Option<(&'a Path, ActivityKind)>) -> Self {
+        self.highlight = highlight;
+        self
     }
 }
 
@@ -46,8 +58,26 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
             // Check if this node is the CWD
             let is_cwd = self.cwd.is_some_and(|cwd| node.is_dir && node.path == cwd);
 
-            // Clear background for CWD item
-            if is_cwd {
+            // The file Claude is working on right now. A write is loud; a read
+            // is quiet, because Claude reads far more than it writes.
+            let active = self
+                .highlight
+                .and_then(|(p, kind)| (p == node.path).then_some(kind));
+
+            let active_bg = match active {
+                Some(ActivityKind::Write) => Some(Color::Rgb(72, 52, 20)),
+                Some(ActivityKind::Read) => Some(Color::Rgb(34, 42, 56)),
+                None => None,
+            };
+
+            // Clear background for CWD or active item
+            if let Some(bg) = active_bg {
+                for x in area.x..area.x + area.width {
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_bg(bg);
+                    }
+                }
+            } else if is_cwd {
                 for x in area.x..area.x + area.width {
                     if let Some(cell) = buf.cell_mut((x, y)) {
                         cell.set_bg(Color::Rgb(80, 70, 30));
@@ -56,7 +86,16 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
             }
 
             let tree_style = Style::default().fg(Color::DarkGray);
-            let node_style = if is_cwd {
+            let node_style = if let Some(kind) = active {
+                let bg = active_bg.unwrap();
+                match kind {
+                    ActivityKind::Write => Style::default()
+                        .bg(bg)
+                        .fg(Color::Rgb(255, 214, 120))
+                        .bold(),
+                    ActivityKind::Read => Style::default().bg(bg).fg(Color::Rgb(150, 190, 240)),
+                }
+            } else if is_cwd {
                 Style::default()
                     .bg(Color::Rgb(80, 70, 30))
                     .fg(Color::Rgb(255, 220, 100))

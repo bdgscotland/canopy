@@ -140,6 +140,37 @@ impl FileTree {
         Ok(())
     }
 
+    /// Index of the node for `path`, if it is currently in the tree.
+    pub fn index_of(&self, path: &Path) -> Option<usize> {
+        self.nodes.iter().position(|n| n.path == path)
+    }
+
+    /// Scroll so `path` is on screen, roughly centred. Returns false when the
+    /// path is not in the tree — it may be newly created, or deeper than
+    /// `max_depth`. Callers can `refresh()` and try once more.
+    pub fn reveal(&mut self, path: &Path, visible_height: usize) -> bool {
+        let Some(idx) = self.index_of(path) else {
+            return false;
+        };
+
+        if visible_height == 0 {
+            return true;
+        }
+
+        // Already comfortably on screen: leave the view alone rather than
+        // yanking it around on every event.
+        let margin = 2usize;
+        let first_settled = self.offset + margin.min(visible_height / 2);
+        let last_settled = (self.offset + visible_height).saturating_sub(margin + 1);
+        if idx >= first_settled && idx <= last_settled {
+            return true;
+        }
+
+        let max_offset = self.nodes.len().saturating_sub(visible_height);
+        self.offset = idx.saturating_sub(visible_height / 2).min(max_offset);
+        true
+    }
+
     pub fn set_root(&mut self, new_root: PathBuf) {
         self.root = new_root;
         self.offset = 0;

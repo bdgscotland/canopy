@@ -117,7 +117,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
 
         // Render file tree
-        let file_tree_widget = FileTreeWidget::new(&app.tree, Some(app.terminal.cwd()));
+        let file_tree_widget = FileTreeWidget::new(&app.tree, Some(app.terminal.cwd()))
+            .highlight(app.highlight.as_ref().map(|(p, k)| (p.as_path(), *k)));
         frame.render_stateful_widget(
             file_tree_widget,
             tree_inner,

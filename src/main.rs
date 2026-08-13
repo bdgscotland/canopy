@@ -1,6 +1,7 @@
 mod activity;
 mod app;
 mod event;
+mod ptywrite;
 mod terminal;
 mod tree;
 mod ui;

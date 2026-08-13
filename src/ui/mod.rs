@@ -24,11 +24,38 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Terminal pane (left/main area)
     let terminal_area = chunks[0];
+    // The breaker's voice. If input is queued and not draining, say so —
+    // otherwise the user types, nothing happens, and there is no explanation.
+    // Also surfaces a refused write (an oversized paste, or a full queue).
+    let stalled = app
+        .terminal
+        .write_stalled_for()
+        .filter(|d| *d >= crate::ptywrite::STALL_NOTICE);
+    let (terminal_title, terminal_colour) = if app.reader_failed_notice {
+        (
+            " Claude Code — terminal feed lost, session still running ".to_string(),
+            Color::Red,
+        )
+    } else if let Some(d) = stalled {
+        (
+            format!(
+                " Claude Code — not reading input, {:.1} KiB queued ({}s) ",
+                app.terminal.queued_input_bytes() as f64 / 1024.0,
+                d.as_secs()
+            ),
+            Color::Yellow,
+        )
+    } else if let Some(ref msg) = app.terminal.last_refusal {
+        (format!(" Claude Code — {msg} "), Color::Yellow)
+    } else {
+        (" Claude Code ".to_string(), Color::Cyan)
+    };
+
     let terminal_block = Block::default()
-        .title(" Claude Code ")
-        .title_style(Style::default().fg(Color::Cyan).bold())
+        .title(terminal_title)
+        .title_style(Style::default().fg(terminal_colour).bold())
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(terminal_colour));
 
     let terminal_inner = terminal_block.inner(terminal_area);
     frame.render_widget(terminal_block, terminal_area);

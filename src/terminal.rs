@@ -1,6 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
-use std::io::{Read, Write};
+
+use crate::ptywrite::{PtyWriteHandle, Refused};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -60,7 +62,12 @@ pub struct TerminalPane {
     /// instead of noticing Claude is gone. Dropping it turns every one of those
     /// permanent hangs into an immediate EIO.
     pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
-    pty_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+    /// All PTY writes go through here, on a dedicated thread. Nothing else may
+    /// write to the master: the event loop must never block on the child, and
+    /// the reader must never wait on a writer lock.
+    writer: Option<PtyWriteHandle>,
+    /// The most recent refusal, for the UI to surface.
+    pub last_refusal: Option<String>,
     vterm: Arc<Mutex<VirtualTerminal>>,
     cwd: PathBuf,
     child_pid: Option<u32>,
@@ -83,7 +90,8 @@ impl TerminalPane {
         let process_exited = Arc::new(AtomicBool::new(false));
         let reader_failed = Arc::new(AtomicBool::new(false));
 
-        let pty_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
+        let writer_slot: Arc<Mutex<Option<PtyWriteHandle>>> = Arc::new(Mutex::new(None));
+        let writer_handle_slot = Arc::clone(&writer_slot);
 
         // Try to create PTY and spawn claude process
         let (pty_master, child_pid) = match Self::try_spawn_claude(
@@ -93,7 +101,7 @@ impl TerminalPane {
             &process_exited,
             &reader_failed,
             pty_tx,
-            &pty_writer,
+            &writer_slot,
         ) {
             Ok((pair, pid)) => (Some(pair), pid),
             Err(e) => {
@@ -109,9 +117,13 @@ impl TerminalPane {
             }
         };
 
+        // Take the handle out of the slot now that spawn has populated it.
+        let writer_handle = lock_or_recover(&writer_handle_slot).clone();
+
         Ok(Self {
             pty_master,
-            pty_writer,
+            writer: writer_handle,
+            last_refusal: None,
             vterm,
             cwd: cwd.to_path_buf(),
             child_pid,
@@ -129,7 +141,7 @@ impl TerminalPane {
         process_exited: &Arc<AtomicBool>,
         reader_failed: &Arc<AtomicBool>,
         pty_tx: mpsc::UnboundedSender<()>,
-        pty_writer: &Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+        writer_slot: &Arc<Mutex<Option<PtyWriteHandle>>>,
     ) -> anyhow::Result<(Box<dyn portable_pty::MasterPty + Send>, Option<u32>)> {
         // Create PTY
         let pty_system = native_pty_system();
@@ -185,8 +197,8 @@ impl TerminalPane {
 
         // Take the writer from master PTY (can only be called once)
         // Store it in the shared Arc<Mutex<>> so both main thread and reader thread can use it
-        if let Ok(writer) = master.take_writer() {
-            *lock_or_recover(pty_writer) = Some(writer);
+        if let Ok(w) = master.take_writer() {
+            *lock_or_recover(writer_slot) = Some(PtyWriteHandle::spawn(w));
         }
 
         // Read output in background thread
@@ -194,7 +206,7 @@ impl TerminalPane {
         let vterm_clone = Arc::clone(vterm);
         let exited_clone = Arc::clone(process_exited);
         let reader_failed_clone = Arc::clone(reader_failed);
-        let writer_clone = Arc::clone(pty_writer);
+        let writer_for_reader = lock_or_recover(writer_slot).clone();
 
         thread::spawn(move || {
             // ChildGuard ensures wait() is called even on panic
@@ -238,14 +250,13 @@ impl TerminalPane {
                                 Vec::new()
                             }
                         };
-                        if !responses.is_empty() {
-                            if let Ok(mut guard) = writer_clone.lock() {
-                                if let Some(ref mut writer) = *guard {
-                                    for resp in responses {
-                                        let _ = writer.write_all(&resp);
-                                    }
-                                    let _ = writer.flush();
-                                }
+                        // Query replies go through the SAME queue as user
+                        // input. This is what deletes the reverse leg of the
+                        // deadlock: the reader never waits on a writer lock, so
+                        // it can always keep draining the master.
+                        if let Some(ref w) = writer_for_reader {
+                            for resp in responses {
+                                let _ = w.write(resp);
                             }
                         }
                         let _ = pty_tx.send(());
@@ -324,12 +335,29 @@ impl TerminalPane {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         let Some(bytes) = encode_key(key) else { return };
-        if let Ok(mut guard) = self.pty_writer.lock() {
-            if let Some(ref mut writer) = *guard {
-                let _ = writer.write_all(&bytes);
-                let _ = writer.flush();
-            }
+        self.enqueue(bytes);
+    }
+
+    /// Hand bytes to the writer thread. Never blocks; records a refusal for the
+    /// UI instead. This is the only path to the PTY.
+    fn enqueue(&mut self, bytes: Vec<u8>) {
+        let Some(ref w) = self.writer else { return };
+        match w.write(bytes) {
+            Ok(()) => self.last_refusal = None,
+            Err(Refused::Closed) => {}
+            Err(e) => self.last_refusal = Some(e.to_string()),
         }
+    }
+
+    /// How long input has been stuck undelivered, if it is. Drives the UI
+    /// notice, so a user whose Claude has stopped reading finds out rather than
+    /// wondering why typing does nothing.
+    pub fn write_stalled_for(&self) -> Option<std::time::Duration> {
+        self.writer.as_ref()?.stalled_for()
+    }
+
+    pub fn queued_input_bytes(&self) -> usize {
+        self.writer.as_ref().map_or(0, |w| w.queued_bytes())
     }
 }
 
@@ -628,14 +656,14 @@ impl TerminalPane {
     /// Send pasted text wrapped in bracketed-paste escape sequences.
     /// This prevents the terminal from interpreting newlines as Enter keypresses.
     pub fn handle_paste(&mut self, text: String) {
-        if let Ok(mut guard) = self.pty_writer.lock() {
-            if let Some(ref mut writer) = *guard {
-                let _ = writer.write_all(b"\x1b[200~");
-                let _ = writer.write_all(text.as_bytes());
-                let _ = writer.write_all(b"\x1b[201~");
-                let _ = writer.flush();
-            }
-        }
+        // One message, so the paste is delivered whole or refused whole. Split
+        // across messages, a refusal partway through would hand Claude an
+        // unterminated bracketed paste and half a command it would then act on.
+        let mut buf = Vec::with_capacity(text.len() + 12);
+        buf.extend_from_slice(b"\x1b[200~");
+        buf.extend_from_slice(text.as_bytes());
+        buf.extend_from_slice(b"\x1b[201~");
+        self.enqueue(buf);
     }
 
     pub fn send_focus_event(&mut self, gained: bool) {
@@ -650,12 +678,7 @@ impl TerminalPane {
         } else {
             b"\x1b[O"
         };
-        if let Ok(mut guard) = self.pty_writer.lock() {
-            if let Some(ref mut writer) = *guard {
-                let _ = writer.write_all(seq);
-                let _ = writer.flush();
-            }
-        }
+        self.enqueue(seq.to_vec());
     }
 
     /// Acquire a poison-safe lock on the virtual terminal.

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crossterm::event::{EventStream, KeyEvent, MouseEvent};
 use futures::StreamExt;
-use notify::{Config as NotifyConfig, PollWatcher, RecursiveMode};
+use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{
     new_debouncer_opt, Config as DebounceConfig, DebounceEventResult, DebouncedEventKind, Debouncer,
 };
@@ -9,8 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-// Tuned for faster UI reflection while keeping duplicate event noise manageable.
-const WATCH_POLL_INTERVAL_MS: u64 = 75;
+// Coalesce bursts (an editor save is several events) without feeling laggy.
 const WATCH_DEBOUNCE_TIMEOUT_MS: u64 = 50;
 
 #[derive(Debug)]
@@ -30,7 +29,7 @@ pub enum Event {
 pub struct EventHandler {
     rx: mpsc::UnboundedReceiver<Event>,
     // Keep the debouncer alive to prevent it from being dropped
-    debouncer: Option<Debouncer<PollWatcher>>,
+    debouncer: Option<Debouncer<RecommendedWatcher>>,
     watched_path: Option<PathBuf>,
 }
 
@@ -141,15 +140,19 @@ impl EventHandler {
 
     fn build_debouncer(
         fs_tx: mpsc::UnboundedSender<Event>,
-    ) -> notify::Result<Debouncer<PollWatcher>> {
-        // Use PollWatcher explicitly because FSEvent can miss events in sandboxed/virtualized environments.
-        let notify_cfg = NotifyConfig::default()
-            .with_poll_interval(Duration::from_millis(WATCH_POLL_INTERVAL_MS));
-        let debounce_cfg = DebounceConfig::default()
-            .with_timeout(Duration::from_millis(WATCH_DEBOUNCE_TIMEOUT_MS))
-            .with_notify_config(notify_cfg);
+    ) -> notify::Result<Debouncer<RecommendedWatcher>> {
+        // Event-driven (FSEvents on macOS, inotify on Linux), NOT polling.
+        //
+        // Upstream used PollWatcher because FSEvents can miss events in some
+        // sandboxed or virtualised environments. The cure was far worse than
+        // the disease: a recursive poll stats every file under the root on a
+        // fixed interval, so a Rust repo with a populated target/ meant ~18,000
+        // stat calls per second and a pegged core. Build artefacts are exactly
+        // what a project tree never displays.
+        let debounce_cfg =
+            DebounceConfig::default().with_timeout(Duration::from_millis(WATCH_DEBOUNCE_TIMEOUT_MS));
 
-        new_debouncer_opt::<_, PollWatcher>(debounce_cfg, move |result: DebounceEventResult| {
+        new_debouncer_opt::<_, RecommendedWatcher>(debounce_cfg, move |result: DebounceEventResult| {
             if let Ok(events) = result {
                 for fs_event in events {
                     if matches!(

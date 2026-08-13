@@ -2,7 +2,12 @@ use anyhow::Result;
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::prelude::Rect;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// A tree rebuild walks the filesystem, so never do it more often than this
+/// however many events arrive.
+const REFRESH_THROTTLE: Duration = Duration::from_millis(250);
 
 use crate::activity::{ActivityKind, ActivityWatcher};
 use crate::terminal::TerminalPane;
@@ -30,6 +35,8 @@ pub struct App {
     /// Set when a revealed path was not in the tree, so the next tick rebuilds
     /// and retries. Claude creating a file is the common case.
     pending_reveal: Option<PathBuf>,
+    last_refresh: Instant,
+    refresh_queued: bool,
 }
 
 impl App {
@@ -55,6 +62,8 @@ impl App {
             activity: ActivityWatcher::new(&canonical_path, std::env::var("CANOPY_SESSION_ID").ok()),
             highlight: None,
             pending_reveal: None,
+            last_refresh: Instant::now(),
+            refresh_queued: false,
         })
     }
 
@@ -69,6 +78,7 @@ impl App {
             self.last_auto_scroll_cwd = None;
         }
 
+        self.flush_queued_refresh();
         self.poll_activity();
 
         // Process clipboard requests from vterm (OSC 52)
@@ -82,6 +92,26 @@ impl App {
             self.tree_loading = false;
         }
         self.terminal.is_process_exited()
+    }
+
+    /// Rebuild the tree, but never more than once per REFRESH_THROTTLE. Bursts
+    /// coalesce into a single walk on a later tick.
+    fn request_refresh(&mut self) {
+        if self.last_refresh.elapsed() >= REFRESH_THROTTLE {
+            self.tree.refresh();
+            self.last_refresh = Instant::now();
+            self.refresh_queued = false;
+        } else {
+            self.refresh_queued = true;
+        }
+    }
+
+    fn flush_queued_refresh(&mut self) {
+        if self.refresh_queued && self.last_refresh.elapsed() >= REFRESH_THROTTLE {
+            self.tree.refresh();
+            self.last_refresh = Instant::now();
+            self.refresh_queued = false;
+        }
     }
 
     /// Pull anything Claude has done since the last tick and follow it.
@@ -103,8 +133,8 @@ impl App {
 
         if !self.tree.reveal(&latest.path, visible) {
             // Not in the tree yet. Claude most likely just created it; rebuild
-            // now and retry on the next tick once the walk has settled.
-            self.tree.refresh();
+            // and retry on a later tick once the walk has settled.
+            self.request_refresh();
             if !self.tree.reveal(&latest.path, visible) {
                 self.pending_reveal = Some(latest.path.clone());
             }
@@ -200,10 +230,15 @@ impl App {
     }
 
     pub fn handle_file_change(&mut self, path: PathBuf) {
-        // Refresh tree if file changed
-        if path.starts_with(self.tree.root_path()) {
-            self.tree.refresh();
+        if !path.starts_with(self.tree.root_path()) {
+            return;
         }
+        // Build output and other ignored paths are never displayed, so a
+        // rebuild would be pure cost. `cargo build` alone emits thousands.
+        if self.tree.is_noise(&path) {
+            return;
+        }
+        self.request_refresh();
     }
 }
 

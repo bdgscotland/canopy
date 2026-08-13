@@ -3,8 +3,22 @@ mod file_node;
 pub use file_node::FileNode;
 
 use anyhow::Result;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
+
+/// Directories never worth reacting to, even when not gitignored. These churn
+/// constantly during a build and are never displayed.
+const ALWAYS_NOISY: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+    "vendor",
+];
 
 pub struct FileTree {
     root: PathBuf,
@@ -12,6 +26,8 @@ pub struct FileTree {
     pub show_hidden: bool,
     max_depth: usize,
     offset: usize,
+    /// Used to discard filesystem events for paths the tree never shows.
+    ignores: Gitignore,
 }
 
 impl FileTree {
@@ -22,6 +38,7 @@ impl FileTree {
             show_hidden,
             max_depth,
             offset: 0,
+            ignores: build_ignores(root),
         };
 
         tree.rebuild_visible_nodes()?;
@@ -171,7 +188,25 @@ impl FileTree {
         true
     }
 
+    /// True when a filesystem event for `path` cannot affect what is displayed,
+    /// so the tree need not be rebuilt. Build output is the case that matters:
+    /// `cargo build` touches thousands of files under `target/`, and rebuilding
+    /// the tree for each one would stall the UI.
+    pub fn is_noise(&self, path: &Path) -> bool {
+        let relative = path.strip_prefix(&self.root).unwrap_or(path);
+        if relative
+            .components()
+            .any(|c| ALWAYS_NOISY.contains(&c.as_os_str().to_string_lossy().as_ref()))
+        {
+            return true;
+        }
+        self.ignores
+            .matched_path_or_any_parents(path, path.is_dir())
+            .is_ignore()
+    }
+
     pub fn set_root(&mut self, new_root: PathBuf) {
+        self.ignores = build_ignores(&new_root);
         self.root = new_root;
         self.offset = 0;
         let _ = self.rebuild_visible_nodes();
@@ -179,5 +214,59 @@ impl FileTree {
 
     pub fn refresh(&mut self) {
         let _ = self.rebuild_visible_nodes();
+    }
+}
+
+/// Compile the root `.gitignore`, if there is one. Nested ignore files are not
+/// consulted: this only filters event noise, and the tree walk itself already
+/// applies full gitignore semantics via `WalkBuilder`.
+fn build_ignores(root: &Path) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(root);
+    let _ = builder.add(root.join(".gitignore"));
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
+#[cfg(test)]
+mod noise_tests {
+    use super::*;
+
+    fn tree_with_gitignore(contents: &str) -> (tempfile::TempDir, FileTree) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), contents).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let tree = FileTree::new(dir.path(), false, 5).unwrap();
+        (dir, tree)
+    }
+
+    #[test]
+    fn build_output_is_noise_even_when_not_gitignored() {
+        // The case that pegged a core: a recursive watcher reporting every file
+        // cargo writes under target/, each one triggering a tree rebuild.
+        let (dir, tree) = tree_with_gitignore("");
+        assert!(tree.is_noise(&dir.path().join("target/debug/build/x/out")));
+        assert!(tree.is_noise(&dir.path().join("node_modules/react/index.js")));
+        assert!(tree.is_noise(&dir.path().join(".git/objects/ab/cdef")));
+    }
+
+    #[test]
+    fn gitignored_paths_are_noise() {
+        let (dir, tree) = tree_with_gitignore("*.log\nscratch/\n");
+        assert!(tree.is_noise(&dir.path().join("debug.log")));
+        assert!(tree.is_noise(&dir.path().join("scratch/notes.txt")));
+    }
+
+    #[test]
+    fn real_source_files_are_never_noise() {
+        let (dir, tree) = tree_with_gitignore("*.log\n");
+        assert!(!tree.is_noise(&dir.path().join("src/main.rs")));
+        assert!(!tree.is_noise(&dir.path().join("README.md")));
+        assert!(!tree.is_noise(&dir.path().join("Cargo.toml")));
+    }
+
+    #[test]
+    fn a_directory_merely_named_like_a_source_dir_is_still_shown() {
+        // "build" is in ALWAYS_NOISY, but only as a path component of the root.
+        let (dir, tree) = tree_with_gitignore("");
+        assert!(!tree.is_noise(&dir.path().join("src/builder.rs")));
     }
 }

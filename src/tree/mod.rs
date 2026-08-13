@@ -62,102 +62,129 @@ impl FileTree {
         self.offset = offset;
     }
 
+    /// The ONLY synchronous walk left, and it runs once at construction before
+    /// the event loop exists. Every later walk goes through spawn_blocking.
     fn rebuild_visible_nodes(&mut self) -> Result<()> {
-        self.nodes.clear();
-
-        // ONE walker for the whole tree.
-        //
-        // The previous implementation created a fresh WalkBuilder per directory
-        // with max_depth(1) and recursed -- 2,045 walkers and 186,649 is_dir()
-        // stats on a 20k-node repo, 443 ms. Every DirEntry already carries its
-        // file type from the readdir, so Path::is_dir() was re-stat-ing paths
-        // the walker had just told us about.
-        //
-        // This blocks the event loop, and in App::new it runs before the PTY is
-        // opened, so Claude does not start until it finishes.
-        let mut children: std::collections::HashMap<PathBuf, Vec<(PathBuf, String, bool)>> =
-            std::collections::HashMap::new();
-
-        let walker = WalkBuilder::new(&self.root)
-            .hidden(!self.show_hidden)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .max_depth(Some(self.max_depth))
-            .build();
-
-        for entry in walker.flatten() {
-            if entry.depth() == 0 {
-                continue;
-            }
-            let path = entry.path();
-            let Some(parent) = path.parent() else { continue };
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !self.show_hidden && name.starts_with('.') {
-                continue;
-            }
-            // file_type() comes from the readdir; is_dir() would re-stat.
-            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
-            children
-                .entry(parent.to_path_buf())
-                .or_default()
-                .push((path.to_path_buf(), name, is_dir));
-        }
-
-        // Dirs first, then case-insensitive by name. Sorting once per directory
-        // with a precomputed key instead of comparing lowercased strings inside
-        // the comparator.
-        for list in children.values_mut() {
-            list.sort_by_cached_key(|(_, name, is_dir)| (!*is_dir, name.to_lowercase()));
-        }
-
-        let root = self.root.clone();
-        let is_dir = root.is_dir();
-        let name = root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| root.to_string_lossy().to_string());
-        self.nodes
-            .push(FileNode::new(root.clone(), name, 0, is_dir, true, vec![]));
-
-        if is_dir {
-            self.emit_children(&root, 1, &[], &children);
-        }
-
+        self.nodes = walk(&self.root, self.show_hidden, self.max_depth);
         Ok(())
     }
 
-    /// Emit a directory's children depth-first, tracking the connector state
-    /// each row needs to draw its ancestry.
-    fn emit_children(
-        &mut self,
-        parent: &Path,
-        depth: usize,
-        connector: &[bool],
-        children: &std::collections::HashMap<PathBuf, Vec<(PathBuf, String, bool)>>,
-    ) {
-        let Some(list) = children.get(parent) else {
-            return;
-        };
-        let total = list.len();
-        for (i, (path, name, is_dir)) in list.iter().enumerate() {
-            let is_last = i == total - 1;
-            self.nodes.push(FileNode::new(
-                path.clone(),
-                name.clone(),
-                depth,
-                *is_dir,
-                is_last,
-                connector.to_vec(),
-            ));
-            if *is_dir {
-                let mut child_connector = connector.to_vec();
-                child_connector.push(is_last);
-                self.emit_children(path, depth + 1, &child_connector, children);
-            }
-        }
+    /// Replace the node list with one produced off-thread by [`walk`].
+    pub fn set_nodes(&mut self, nodes: Vec<FileNode>) {
+        self.nodes = nodes;
+        let max_offset = self.nodes.len().saturating_sub(1);
+        self.offset = self.offset.min(max_offset);
     }
 
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
+    }
+
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+}
+
+/// Walk `root` and produce the visible node list.
+///
+/// A free function, and deliberately so: this is unbounded I/O whose cost is a
+/// property of the filesystem, not of anything Canopy controls. It must be
+/// callable from `spawn_blocking`, off the event-loop thread. Running it inline
+/// froze the UI hard enough to need SIGKILL.
+pub fn walk(root: &Path, show_hidden: bool, max_depth: usize) -> Vec<FileNode> {
+    // ONE walker for the whole tree. The previous implementation created a
+    // fresh WalkBuilder per directory with max_depth(1) and recursed -- 2,045
+    // walkers and 186,649 is_dir() stats on a 20k-node repo, 443 ms. Every
+    // DirEntry already carries its file type from the readdir, so is_dir() was
+    // re-stat-ing paths the walker had just described.
+    let mut children: std::collections::HashMap<PathBuf, Vec<(PathBuf, String, bool)>> =
+        std::collections::HashMap::new();
+
+    let walker = WalkBuilder::new(root)
+        .hidden(!show_hidden)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .max_depth(Some(max_depth))
+        .build();
+
+    for entry in walker.flatten() {
+        if entry.depth() == 0 {
+            continue;
+        }
+        let path = entry.path();
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+        children
+            .entry(parent.to_path_buf())
+            .or_default()
+            .push((path.to_path_buf(), name, is_dir));
+    }
+
+    // Dirs first, then case-insensitive by name, sorted once per directory
+    // with a precomputed key.
+    for list in children.values_mut() {
+        list.sort_by_cached_key(|(_, name, is_dir)| (!*is_dir, name.to_lowercase()));
+    }
+
+    let mut nodes = Vec::new();
+    let is_dir = root.is_dir();
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| root.to_string_lossy().to_string());
+    nodes.push(FileNode::new(
+        root.to_path_buf(),
+        name,
+        0,
+        is_dir,
+        true,
+        vec![],
+    ));
+    if is_dir {
+        emit_children(&mut nodes, root, 1, &[], &children);
+    }
+    nodes
+}
+
+/// Emit a directory's children depth-first, tracking the connector state each
+/// row needs to draw its ancestry.
+fn emit_children(
+    nodes: &mut Vec<FileNode>,
+    parent: &Path,
+    depth: usize,
+    connector: &[bool],
+    children: &std::collections::HashMap<PathBuf, Vec<(PathBuf, String, bool)>>,
+) {
+    let Some(list) = children.get(parent) else {
+        return;
+    };
+    let total = list.len();
+    for (i, (path, name, is_dir)) in list.iter().enumerate() {
+        let is_last = i == total - 1;
+        nodes.push(FileNode::new(
+            path.clone(),
+            name.clone(),
+            depth,
+            *is_dir,
+            is_last,
+            connector.to_vec(),
+        ));
+        if *is_dir {
+            let mut child_connector = connector.to_vec();
+            child_connector.push(is_last);
+            emit_children(nodes, path, depth + 1, &child_connector, children);
+        }
+    }
+}
+
+impl FileTree {
     /// Index of the node for `path`, if it is currently in the tree.
     pub fn index_of(&self, path: &Path) -> Option<usize> {
         self.nodes.iter().position(|n| n.path == path)
@@ -229,15 +256,17 @@ impl FileTree {
             .is_ignore()
     }
 
+    /// Re-root WITHOUT walking. The caller must schedule a walk via
+    /// `App::request_refresh`, which runs it off the event-loop thread.
+    ///
+    /// This used to walk inline. It is called from `tick()`, so re-rooting to a
+    /// large directory froze the UI until the walk finished — the failure that
+    /// needed SIGKILL.
     pub fn set_root(&mut self, new_root: PathBuf) {
         self.ignores = build_ignores(&new_root);
         self.root = new_root;
         self.offset = 0;
-        let _ = self.rebuild_visible_nodes();
-    }
-
-    pub fn refresh(&mut self) {
-        let _ = self.rebuild_visible_nodes();
+        self.nodes.clear();
     }
 }
 
@@ -311,14 +340,29 @@ mod walk_tests {
         // meaning. Without this the fixture would silently test nothing.
         std::fs::create_dir_all(p.join(".git")).unwrap();
         std::fs::write(p.join(".gitignore"), "ignored.txt\nbuilt/\n").unwrap();
-        for dir in ["src", "src/inner", "src/inner/deep", "zed", "Alpha", "built"] {
+        for dir in [
+            "src",
+            "src/inner",
+            "src/inner/deep",
+            "zed",
+            "Alpha",
+            "built",
+        ] {
             std::fs::create_dir_all(p.join(dir)).unwrap();
         }
         for f in [
-            "README.md", "Cargo.toml", "ignored.txt",
-            "src/main.rs", "src/lib.rs", "src/Zed.rs", "src/alpha.rs",
-            "src/inner/a.rs", "src/inner/deep/b.rs",
-            "zed/z.rs", "Alpha/a.rs", "built/artifact.o",
+            "README.md",
+            "Cargo.toml",
+            "ignored.txt",
+            "src/main.rs",
+            "src/lib.rs",
+            "src/Zed.rs",
+            "src/alpha.rs",
+            "src/inner/a.rs",
+            "src/inner/deep/b.rs",
+            "zed/z.rs",
+            "Alpha/a.rs",
+            "built/artifact.o",
         ] {
             std::fs::write(p.join(f), "x").unwrap();
         }
@@ -372,8 +416,14 @@ mod walk_tests {
         ];
         assert_eq!(body, expected, "walk output changed");
 
-        assert!(!got.iter().any(|s| s.contains("ignored.txt")), "gitignore ignored");
-        assert!(!got.iter().any(|s| s.contains("built")), "built/ not excluded");
+        assert!(
+            !got.iter().any(|s| s.contains("ignored.txt")),
+            "gitignore ignored"
+        );
+        assert!(
+            !got.iter().any(|s| s.contains("built")),
+            "built/ not excluded"
+        );
     }
 
     #[test]

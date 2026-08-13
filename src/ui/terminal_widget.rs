@@ -16,8 +16,9 @@ impl<'a> TerminalWidget<'a> {
         }
     }
 
-    /// Check if a given (col, row) is within the selection range.
-    fn is_selected(&self, col: u16, row: u16) -> bool {
+    /// Is this cell inside the selection? `line` is an ABSOLUTE line number,
+    /// so the highlight stays on the same text as the view scrolls.
+    fn is_selected(&self, col: u16, line: u64) -> bool {
         let sel = match self.selection {
             Some(s) => s,
             None => return false,
@@ -30,16 +31,21 @@ impl<'a> TerminalWidget<'a> {
             (sel.end, sel.start)
         };
 
-        if row < start.1 || row > end.1 {
+        if line < start.1 || line > end.1 {
             return false;
         }
-        if row == start.1 && row == end.1 {
-            return col >= start.0 && col <= end.0;
+        if start.1 == end.1 {
+            let (lo, hi) = if start.0 <= end.0 {
+                (start.0, end.0)
+            } else {
+                (end.0, start.0)
+            };
+            return col >= lo && col <= hi;
         }
-        if row == start.1 {
+        if line == start.1 {
             return col >= start.0;
         }
-        if row == end.1 {
+        if line == end.1 {
             return col <= end.0;
         }
         true
@@ -69,7 +75,8 @@ impl<'a> Widget for TerminalWidget<'a> {
                         if x < area.x + area.width && y < area.y + area.height {
                             if let Some(buf_cell) = buf.cell_mut((x, y)) {
                                 buf_cell.set_symbol(&cell.ch);
-                                let style = if self.is_selected(col_idx as u16, row_idx as u16) {
+                                let abs = vterm.absolute_line(scrollback.len() + row_idx);
+                                let style = if self.is_selected(col_idx as u16, abs) {
                                     cell.style.add_modifier(Modifier::REVERSED)
                                 } else {
                                     cell.style
@@ -107,7 +114,8 @@ impl<'a> Widget for TerminalWidget<'a> {
                         if x < area.x + area.width && y < area.y + area.height {
                             if let Some(buf_cell) = buf.cell_mut((x, y)) {
                                 buf_cell.set_symbol(&cell.ch);
-                                let style = if self.is_selected(col_idx as u16, screen_row as u16) {
+                                let abs = vterm.absolute_line(line_idx);
+                                let style = if self.is_selected(col_idx as u16, abs) {
                                     cell.style.add_modifier(Modifier::REVERSED)
                                 } else {
                                     cell.style

@@ -1,149 +1,77 @@
-# Contributing to cltree
+# Contributing to Canopy
 
-Thank you for your interest in contributing to cltree! This document provides guidelines and instructions for contributing.
-
-## Language Policy
-
-- **English is preferred** for all contributions including code, comments, documentation, issues, and pull requests.
-- This ensures the project is accessible to the global community.
-
-## Development Requirements
-
-- **Rust**: 1.70 or later
-- **Cargo**: Rust's package manager (included with Rust)
-- **Git**: For version control
-
-## Getting Started
-
-1. Fork the repository on GitHub
-2. Clone your fork locally:
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/cltree.git
-   cd cltree
-   ```
-3. Add the upstream repository as a remote:
-   ```bash
-   git remote add upstream https://github.com/jsleemaster/cltree.git
-   ```
-
-## Build Commands
+## Build and run
 
 ```bash
-# Build the project
-cargo build
-
-# Build release version
 cargo build --release
-
-# Run tests
-cargo test
-
-# Check code formatting
-cargo fmt --check
-
-# Apply code formatting
-cargo fmt
-
-# Run linter
-cargo clippy
-
-# Run linter with warnings as errors
-cargo clippy -- -D warnings
-
-# Run the application
-cargo run
+./target/release/canopy          # runs Claude with the tree beside it
+CANOPY_COMMAND=bash ./target/release/canopy   # host something else while hacking
 ```
 
-## Alternative Installation (for Rust developers)
+## The gates
 
-If you have Rust installed, you can install cltree directly:
+CI runs these, and so should you before pushing:
 
 ```bash
-# From crates.io
-cargo install cltree
-
-# From source
-git clone https://github.com/jsleemaster/cltree.git
-cd cltree
-cargo install --path .
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-## Code Conventions
+## What this project is careful about
 
-- **Edition**: Rust 2021
-- **Formatting**: Follow `rustfmt` defaults (run `cargo fmt` before committing)
-- **Linting**: Code must pass `cargo clippy` without warnings
-- **Naming**:
-  - `snake_case` for functions, methods, variables, and modules
-  - `PascalCase` for types, traits, and enums
-  - `SCREAMING_SNAKE_CASE` for constants
-- **Error Handling**: Use `anyhow::Result` for application code, `thiserror` for library boundaries
-- **Comments**: Public APIs should have English doc comments
+Canopy hosts Claude Code in a PTY and redraws its output. Three requirements
+follow from that, and most review attention goes to them.
 
-## Contribution Workflow
+**1. Claude must render exactly as it does without Canopy.** An escape sequence
+modelled wrongly is visible corruption. Two such bugs have already shipped, both
+in the same class: a CSI sequence carrying a private marker (`ESC[>4;2m`,
+`ESC[<u`) was executed as the standard sequence sharing its final byte.
 
-1. **Create a branch** for your work:
-   ```bash
-   git checkout -b feature/your-feature-name
-   # or
-   git checkout -b fix/your-bug-fix
-   ```
+If you touch `src/vterm.rs`, assume you have introduced a fidelity bug and go
+looking for it.
 
-2. **Make your changes** following the code conventions above.
+**2. Idle must cost nothing.** No polling, no periodic scanning, no timers that
+run when nothing is happening. The watcher is event-driven and the transcript
+poll is a `stat` against a stored offset. A regression here is easy to introduce
+and invisible without measurement — `examples/watchcost` and `examples/treecost`
+exist for that.
 
-3. **Test your changes**:
-   ```bash
-   cargo test
-   cargo fmt --check
-   cargo clippy -- -D warnings
-   ```
+**3. Canopy must not degrade Claude.** Input is forwarded uninterpreted. Work
+that blocks the event loop delays keystrokes and repaints; the tree walk used to
+run before the PTY was even opened.
 
-4. **Commit your changes** with a clear message:
-   ```bash
-   git commit -m "feat: add amazing new feature"
-   # or
-   git commit -m "fix: resolve issue with file tree"
-   ```
+## Testing the terminal emulator
 
-   Commit message prefixes:
-   - `feat:` - New feature
-   - `fix:` - Bug fix
-   - `docs:` - Documentation changes
-   - `refactor:` - Code refactoring
-   - `test:` - Adding or updating tests
-   - `chore:` - Maintenance tasks
+`src/vterm.rs` is a hand-written terminal emulator. Reasoning about it is not
+enough — every bug found in it so far was found by measurement or by looking at
+a screenshot, never by reading the code.
 
-5. **Push to your fork**:
-   ```bash
-   git push origin feature/your-feature-name
-   ```
+**Replay real captures.** `tests/fixtures/claude-startup.raw` is a real Claude
+session captured through a PTY. Prefer adding a capture over hand-writing an
+escape sequence you believe Claude emits.
 
-6. **Open a Pull Request** on GitHub against the `main` branch.
+**Assert the invariant, not the instance.** The four panic fixes are pinned by
+tests that sweep every scroll region and every erase operation at degenerate
+geometries, because each was one instance of "grid indices were validated
+against `rows`/`cols` while nothing guaranteed the grid had those dimensions".
 
-## Pull Request Guidelines
+**Use an oracle.** `tmux` has been an emulator for fifteen years and
+`tmux capture-pane -p -e` dumps its rendered grid with styling. Feed it the same
+bytes and diff. Both sides need normalising first — tmux emits `ESC[0m` where
+the source sent `ESC[22m` — so compare parsed cells, not text.
 
-- Fill out the PR template completely
-- Link any related issues
-- Ensure all CI checks pass
-- Keep PRs focused on a single change
-- Update documentation if needed
-- Add tests for new functionality
+**A regression test must fail before the fix.** Verify that it does.
 
-## Reporting Issues
+## Commit messages
 
-- Check existing issues before creating a new one
-- Use the issue templates provided
-- Include reproduction steps for bugs
-- Provide environment details (OS, Rust version, terminal)
+Say what was wrong and how you know. A measurement, a quoted line, a spec
+citation, or a reproduction — not an assertion. `git log` is the record of why
+this code is shaped the way it is, and `DECISIONS.md` carries the decisions that
+outlived their commits.
 
-## Code of Conduct
+## Relationship to cltree
 
-Be respectful and inclusive. We welcome contributors from all backgrounds and experience levels.
-
-## Questions?
-
-If you have questions, feel free to:
-- Open a [Discussion](https://github.com/jsleemaster/cltree/discussions)
-- Ask in your PR or issue
-
-Thank you for contributing!
+Canopy is a fork of [cltree](https://github.com/jsleemaster/cltree) (MIT).
+Fixes to code inherited from cltree are worth offering upstream — the
+`ESC[>4;2m` fix applies there unchanged.

@@ -47,6 +47,14 @@ pub struct VirtualTerminal {
     // Alternate screen buffer (used by full-screen apps like vim, less, etc.)
     saved_grid: Option<Vec<Vec<Cell>>>,
     saved_scrollback: Option<VecDeque<Vec<Cell>>>,
+    /// Lines that have fallen out of the front of `scrollback`, ever.
+    ///
+    /// Selections anchor to ABSOLUTE line numbers rather than screen rows.
+    /// Screen coordinates move under the text whenever the view scrolls, and
+    /// indices into `scrollback` shift whenever a line is evicted; this counter
+    /// makes `lines_evicted + index` monotonic, so a highlight stays on the
+    /// text the user actually selected.
+    lines_evicted: u64,
     saved_main_cursor: Option<CursorState>,
     parser: Option<vte::Parser>,
     // Scroll region (DECSTBM): top..bottom (0-indexed, bottom is exclusive)
@@ -77,6 +85,7 @@ impl VirtualTerminal {
             saved_cursor: None,
             saved_grid: None,
             saved_scrollback: None,
+            lines_evicted: 0,
             saved_main_cursor: None,
             parser: Some(vte::Parser::new()),
             scroll_top: 0,
@@ -187,6 +196,29 @@ impl VirtualTerminal {
         &self.cursor
     }
 
+    /// Absolute number of the first line still held in `scrollback`.
+    pub fn lines_evicted(&self) -> u64 {
+        self.lines_evicted
+    }
+
+    /// Absolute line number for an index into the virtual `scrollback ++ grid`
+    /// buffer, which is how the widget walks lines when rendering.
+    pub fn absolute_line(&self, view_index: usize) -> u64 {
+        self.lines_evicted + view_index as u64
+    }
+
+    /// Index into `scrollback ++ grid` of the topmost line currently on screen.
+    pub fn top_view_index(&self, visible_height: usize) -> usize {
+        if self.scroll_offset == 0 {
+            self.scrollback.len()
+        } else {
+            let total = self.scrollback.len() + self.grid.len();
+            total
+                .saturating_sub(self.scroll_offset)
+                .saturating_sub(visible_height)
+        }
+    }
+
     pub fn scrollback(&self) -> &VecDeque<Vec<Cell>> {
         &self.scrollback
     }
@@ -237,6 +269,7 @@ impl VirtualTerminal {
             self.scrollback.push_back(removed);
             if self.scrollback.len() > MAX_SCROLLBACK {
                 self.scrollback.pop_front();
+                self.lines_evicted += 1;
             }
         }
         // Insert blank row at the bottom of the scroll region
@@ -419,8 +452,14 @@ impl VirtualTerminal {
                     if param.len() == 1 {
                         if let Some(sub) = iter.next() {
                             match sub[0] {
-                                5 => { iter.next(); }
-                                2 => { iter.next(); iter.next(); iter.next(); }
+                                5 => {
+                                    iter.next();
+                                }
+                                2 => {
+                                    iter.next();
+                                    iter.next();
+                                    iter.next();
+                                }
                                 _ => {}
                             }
                         }
@@ -647,6 +686,11 @@ impl VirtualTerminal {
         self.saved_grid = Some(self.grid.clone());
         self.saved_scrollback = Some(self.scrollback.clone());
         self.saved_main_cursor = Some(self.cursor.clone());
+        // Both the scrollback AND the grid are replaced, so every line number
+        // currently addressable must be retired. Bumping past only the
+        // scrollback would let alt-screen content reuse numbers a live
+        // selection still holds, and the highlight would land on new text.
+        self.lines_evicted += (self.scrollback.len() + self.grid.len()) as u64;
         self.grid = Self::make_grid(self.cols, self.rows);
         self.scrollback.clear();
         self.cursor = CursorState::default();
@@ -657,6 +701,9 @@ impl VirtualTerminal {
             self.grid = grid;
         }
         if let Some(scrollback) = self.saved_scrollback.take() {
+            // Same on the way out: restoring an older buffer would move
+            // indices backwards, so retire everything the alt screen used.
+            self.lines_evicted += (self.scrollback.len() + self.grid.len()) as u64;
             self.scrollback = scrollback;
         }
         if let Some(cursor) = self.saved_main_cursor.take() {
@@ -1043,7 +1090,8 @@ impl Perform for VirtualTerminal {
                     self.response_queue.push(b"\x1b[>0;10;1c".to_vec());
                 } else {
                     // DA1: VT220 with the feature set we actually implement.
-                    self.response_queue.push(b"\x1b[?62;1;2;6;9;15;22c".to_vec());
+                    self.response_queue
+                        .push(b"\x1b[?62;1;2;6;9;15;22c".to_vec());
                 }
             }
             // XTVERSION — Claude sends ESC[>0q at startup.
@@ -1354,10 +1402,18 @@ mod tests {
         let b = cell_at(&vt, 0, 1);
         assert_eq!(a.ch, "A");
         assert_eq!(b.ch, "B");
-        assert!(a.style.add_modifier.contains(ratatui::style::Modifier::UNDERLINED),
-                "4:3 should underline");
-        assert!(!b.style.add_modifier.contains(ratatui::style::Modifier::UNDERLINED),
-                "4:0 must clear the underline");
+        assert!(
+            a.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "4:3 should underline"
+        );
+        assert!(
+            !b.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "4:0 must clear the underline"
+        );
     }
 
     #[test]
@@ -1369,10 +1425,17 @@ mod tests {
         vt.feed(b"\x1b[38:2::255:0:0;1mX");
         let x = cell_at(&vt, 0, 0);
         assert_eq!(x.ch, "X");
-        assert_eq!(x.style.fg, Some(ratatui::style::Color::Rgb(255, 0, 0)),
-                   "colon-form truecolor must be parsed");
-        assert!(x.style.add_modifier.contains(ratatui::style::Modifier::BOLD),
-                "the parameter after a colon-form colour must not be swallowed");
+        assert_eq!(
+            x.style.fg,
+            Some(ratatui::style::Color::Rgb(255, 0, 0)),
+            "colon-form truecolor must be parsed"
+        );
+        assert!(
+            x.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "the parameter after a colon-form colour must not be swallowed"
+        );
     }
 
     /// The invariant every grid-mutating path must preserve. Indices were being
@@ -1426,11 +1489,27 @@ mod tests {
         let mut vt = VirtualTerminal::new(10, 2);
         vt.feed(b"\x1b[37mA\x1b[97mB\x1b[47mC\x1b[107mD");
         let g = vt.grid();
-        assert_eq!(g[0][0].style.fg, Some(Color::Gray), "SGR 37 is normal white");
-        assert_eq!(g[0][1].style.fg, Some(Color::White), "SGR 97 is bright white");
+        assert_eq!(
+            g[0][0].style.fg,
+            Some(Color::Gray),
+            "SGR 37 is normal white"
+        );
+        assert_eq!(
+            g[0][1].style.fg,
+            Some(Color::White),
+            "SGR 97 is bright white"
+        );
         assert_ne!(g[0][0].style.fg, g[0][1].style.fg, "37 and 97 must differ");
-        assert_eq!(g[0][2].style.bg, Some(Color::Gray), "SGR 47 is normal white bg");
-        assert_eq!(g[0][3].style.bg, Some(Color::White), "SGR 107 is bright white bg");
+        assert_eq!(
+            g[0][2].style.bg,
+            Some(Color::Gray),
+            "SGR 47 is normal white bg"
+        );
+        assert_eq!(
+            g[0][3].style.bg,
+            Some(Color::White),
+            "SGR 107 is bright white bg"
+        );
     }
 
     #[test]
@@ -1441,16 +1520,16 @@ mod tests {
         use ratatui::style::Modifier;
         for seq in [
             &b"\x1b[>4;2m"[..], // modifyOtherKeys, not SGR 4;2
-            b"\x1b[<u",          // kitty pop,        not DECRC
-            b"\x1b[>1u",         // kitty push,       not DECRC
-            b"\x1b[?1049s",      // XTSAVE,           not DECSC
-            b"\x1b[=1c",         // DA3,              not DA1
-            b"\x1b[>2J",         // private,          not ED
-            b"\x1b[?2K",         // private,          not EL
-            b"\x1b[!p",          // DECSTR,           not unknown
-            b"\x1b[ q",          // DECSCUSR,         not XTVERSION
-            b"\x1b#8",           // DECALN,           not DECRC
-            b"\x1b(B",           // charset select,   not ESC B
+            b"\x1b[<u",         // kitty pop,        not DECRC
+            b"\x1b[>1u",        // kitty push,       not DECRC
+            b"\x1b[?1049s",     // XTSAVE,           not DECSC
+            b"\x1b[=1c",        // DA3,              not DA1
+            b"\x1b[>2J",        // private,          not ED
+            b"\x1b[?2K",        // private,          not EL
+            b"\x1b[!p",         // DECSTR,           not unknown
+            b"\x1b[ q",         // DECSCUSR,         not XTVERSION
+            b"\x1b#8",          // DECALN,           not DECRC
+            b"\x1b(B",          // charset select,   not ESC B
         ] {
             let mut vt = VirtualTerminal::new(20, 5);
             vt.feed(b"\x1b[3;7H");
@@ -1535,11 +1614,26 @@ mod tests {
         // Block::inner() every frame, so a 2-row-tall window yields zero rows.
         for (cols, rows) in [(0usize, 24usize), (78, 0), (0, 0), (1, 1)] {
             for seq in [
-                &b"\x1b[J"[..], b"\x1b[1J", b"\x1b[2J", b"\x1b[3J",
-                b"\x1b[K", b"\x1b[1K", b"\x1b[2K",
-                b"\x1b[P", b"\x1b[@", b"\x1b[X", b"\x1b[L", b"\x1b[M",
-                b"\x1b[S", b"\x1b[T", b"\x1bM", b"\x1bD",
-                b"\x1b[1;1H", b"\x1b[99;99H", b"\x1b[999X", b"\x1b[r",
+                &b"\x1b[J"[..],
+                b"\x1b[1J",
+                b"\x1b[2J",
+                b"\x1b[3J",
+                b"\x1b[K",
+                b"\x1b[1K",
+                b"\x1b[2K",
+                b"\x1b[P",
+                b"\x1b[@",
+                b"\x1b[X",
+                b"\x1b[L",
+                b"\x1b[M",
+                b"\x1b[S",
+                b"\x1b[T",
+                b"\x1bM",
+                b"\x1bD",
+                b"\x1b[1;1H",
+                b"\x1b[99;99H",
+                b"\x1b[999X",
+                b"\x1b[r",
             ] {
                 let mut vt = VirtualTerminal::new(cols, rows);
                 vt.feed(seq);
@@ -1571,10 +1665,16 @@ mod tests {
         vt.feed(b"\x1b[>4;2mA");
         let a = vt.grid()[0][0].clone();
         assert_eq!(a.ch, "A");
-        assert!(!a.style.add_modifier.contains(ratatui::style::Modifier::UNDERLINED),
-                "ESC[>4;2m must not underline");
-        assert!(!a.style.add_modifier.contains(ratatui::style::Modifier::DIM),
-                "ESC[>4;2m must not dim");
+        assert!(
+            !a.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "ESC[>4;2m must not underline"
+        );
+        assert!(
+            !a.style.add_modifier.contains(ratatui::style::Modifier::DIM),
+            "ESC[>4;2m must not dim"
+        );
     }
 
     #[test]
@@ -1588,16 +1688,30 @@ mod tests {
         let mut dim = 0;
         for row in vt.grid() {
             for cell in row {
-                if cell.ch.trim().is_empty() { continue; }
-                if cell.style.add_modifier.contains(ratatui::style::Modifier::UNDERLINED) {
+                if cell.ch.trim().is_empty() {
+                    continue;
+                }
+                if cell
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+                {
                     underlined += 1;
                 }
-                if cell.style.add_modifier.contains(ratatui::style::Modifier::DIM) {
+                if cell
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::DIM)
+                {
                     dim += 1;
                 }
             }
         }
-        assert_eq!(underlined, 0, "{} cells wrongly underlined after real startup", underlined);
+        assert_eq!(
+            underlined, 0,
+            "{} cells wrongly underlined after real startup",
+            underlined
+        );
         assert_eq!(dim, 0, "{} cells wrongly dimmed after real startup", dim);
     }
 
@@ -1637,5 +1751,66 @@ mod tests {
         vt.feed("한".as_bytes());
         assert_eq!(vt.cols, 0);
         assert_eq!(vt.rows, 0);
+    }
+}
+
+#[cfg(test)]
+mod selection_anchor_tests {
+    use super::*;
+
+    /// Absolute line numbers must survive scrollback eviction, or a selection
+    /// silently slides onto different text once the buffer wraps.
+    #[test]
+    fn absolute_lines_survive_eviction() {
+        let mut vt = VirtualTerminal::new(20, 3);
+        for i in 0..10 {
+            vt.feed(format!("line{i}\r\n").as_bytes());
+        }
+        let before_evicted = vt.lines_evicted();
+        let first_line_abs = vt.absolute_line(0);
+        assert_eq!(first_line_abs, before_evicted);
+
+        for i in 0..MAX_SCROLLBACK + 50 {
+            vt.feed(format!("more{i}\r\n").as_bytes());
+        }
+        assert!(vt.lines_evicted() > before_evicted, "nothing was evicted");
+        assert_eq!(vt.absolute_line(0), vt.lines_evicted());
+        assert!(vt.absolute_line(0) > first_line_abs);
+    }
+
+    #[test]
+    fn top_view_index_tracks_the_scroll_position() {
+        let mut vt = VirtualTerminal::new(20, 4);
+        for i in 0..20 {
+            vt.feed(format!("l{i}\r\n").as_bytes());
+        }
+        let sb = vt.scrollback().len();
+        assert!(sb > 0);
+
+        assert_eq!(vt.scroll_offset(), 0);
+        assert_eq!(vt.top_view_index(4), sb);
+
+        vt.set_scroll_offset(3);
+        let total = sb + vt.grid().len();
+        assert_eq!(vt.top_view_index(4), total - 3 - 4);
+    }
+
+    #[test]
+    fn clearing_scrollback_does_not_reuse_line_numbers() {
+        // Alt-screen entry clears scrollback. Without bumping the counter the
+        // new content reuses numbers a live selection still holds.
+        let mut vt = VirtualTerminal::new(20, 3);
+        for i in 0..30 {
+            vt.feed(format!("a{i}\r\n").as_bytes());
+        }
+        let highest = vt.absolute_line(vt.scrollback().len() + vt.grid().len());
+        vt.feed(b"\x1b[?1049h");
+        for i in 0..30 {
+            vt.feed(format!("b{i}\r\n").as_bytes());
+        }
+        assert!(
+            vt.absolute_line(0) >= highest,
+            "line numbers were reused after the buffer was cleared"
+        );
     }
 }

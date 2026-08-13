@@ -157,21 +157,24 @@ impl EventHandler {
         // fixed interval, so a Rust repo with a populated target/ meant ~18,000
         // stat calls per second and a pegged core. Build artefacts are exactly
         // what a project tree never displays.
-        let debounce_cfg =
-            DebounceConfig::default().with_timeout(Duration::from_millis(WATCH_DEBOUNCE_TIMEOUT_MS));
+        let debounce_cfg = DebounceConfig::default()
+            .with_timeout(Duration::from_millis(WATCH_DEBOUNCE_TIMEOUT_MS));
 
-        new_debouncer_opt::<_, RecommendedWatcher>(debounce_cfg, move |result: DebounceEventResult| {
-            if let Ok(events) = result {
-                for fs_event in events {
-                    if matches!(
-                        fs_event.kind,
-                        DebouncedEventKind::Any | DebouncedEventKind::AnyContinuous
-                    ) {
-                        let _ = fs_tx.send(Event::FileChange(fs_event.path));
+        new_debouncer_opt::<_, RecommendedWatcher>(
+            debounce_cfg,
+            move |result: DebounceEventResult| {
+                if let Ok(events) = result {
+                    for fs_event in events {
+                        if matches!(
+                            fs_event.kind,
+                            DebouncedEventKind::Any | DebouncedEventKind::AnyContinuous
+                        ) {
+                            let _ = fs_tx.send(Event::FileChange(fs_event.path));
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
     }
 
     pub fn update_watch_path(&mut self, watch_path: Option<PathBuf>) {

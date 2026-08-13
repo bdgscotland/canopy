@@ -40,8 +40,6 @@ pub struct TerminalPane {
     last_cols: u16,
     last_rows: u16,
     // Debounce: pending CWD change must be detected consistently before applying
-    pending_cwd: Option<PathBuf>,
-    pending_cwd_count: u32,
 }
 
 impl TerminalPane {
@@ -87,8 +85,6 @@ impl TerminalPane {
             process_exited,
             last_cols: 80,
             last_rows: 24,
-            pending_cwd: None,
-            pending_cwd_count: 0,
         })
     }
 
@@ -214,8 +210,6 @@ impl TerminalPane {
                     let cur_depth = self.cwd.components().count();
                     if new_depth >= cur_depth {
                         self.cwd = reported.to_path_buf();
-                        self.pending_cwd = None;
-                        self.pending_cwd_count = 0;
                         return;
                     }
                 }
@@ -230,102 +224,25 @@ impl TerminalPane {
                     let cur_depth = self.cwd.components().count();
                     if new_depth >= cur_depth {
                         self.cwd = proc_cwd;
-                        self.pending_cwd = None;
-                        self.pending_cwd_count = 0;
-                        return;
                     }
                 }
             }
         }
 
-        // 3. Fall back to vterm buffer scanning (for Claude Code UI which doesn't cd)
-        if let Ok(mut vt) = self.vterm.lock() {
-            // Scan vterm buffer for CWD path displayed by Claude Code.
-            // Collect ALL valid paths and pick the deepest (most specific) one.
-            let home = dirs::home_dir().unwrap_or_default();
-            let mut best_path: Option<PathBuf> = None;
-            let mut best_depth: usize = 0;
-
-            for row in 0..8.min(vt.rows()) {
-                let text = vt.row_text(row);
-                let trimmed = text.trim();
-
-                let resolved = if let Some(pos) = trimmed.find("~/") {
-                    let rest = &trimmed[pos + 2..];
-                    let path_part: String = rest
-                        .chars()
-                        .take_while(|c| {
-                            c.is_alphanumeric() || matches!(*c, '/' | '.' | '-' | '_' | '+' | '@')
-                        })
-                        .collect();
-                    if path_part.is_empty() {
-                        None
-                    } else {
-                        Some(home.join(path_part.trim_end_matches('/')))
-                    }
-                } else if let Some(pos) = trimmed.find('/') {
-                    let path_part: String = trimmed[pos..]
-                        .chars()
-                        .take_while(|c| {
-                            c.is_alphanumeric() || matches!(*c, '/' | '.' | '-' | '_' | '+' | '@')
-                        })
-                        .collect();
-                    if path_part.len() > 1 {
-                        Some(PathBuf::from(path_part.trim_end_matches('/')))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(path) = resolved {
-                    if path.is_dir() {
-                        let depth = path.components().count();
-                        if depth > best_depth {
-                            best_depth = depth;
-                            best_path = Some(path);
-                        }
-                    }
-                }
-            }
-
-            if let Some(path) = best_path {
-                if path == self.cwd {
-                    // Same as current — stable
-                    self.pending_cwd = None;
-                    self.pending_cwd_count = 0;
-                } else {
-                    let new_depth = path.components().count();
-                    let cur_depth = self.cwd.components().count();
-
-                    if new_depth > cur_depth {
-                        // Deeper path — apply immediately (user navigated deeper)
-                        self.cwd = path;
-                        self.pending_cwd = None;
-                        self.pending_cwd_count = 0;
-                    } else if new_depth < cur_depth {
-                        // Shallower path — require consistent detection to prevent flickering
-                        if self.pending_cwd.as_ref() == Some(&path) {
-                            self.pending_cwd_count += 1;
-                            if self.pending_cwd_count >= 8 {
-                                // ~2 seconds of consistent shallow detection
-                                self.cwd = path;
-                                self.pending_cwd = None;
-                                self.pending_cwd_count = 0;
-                                // Clear stale OSC 7 cache so it doesn't immediately
-                                // override the fallback-scanned CWD next tick
-                                vt.clear_reported_cwd();
-                            }
-                        } else {
-                            self.pending_cwd = Some(path);
-                            self.pending_cwd_count = 1;
-                        }
-                    }
-                    // Same depth — ignore (stay at current)
-                }
-            }
-        }
+        // 3. NO screen scraping.
+        //
+        // This used to scan the top 8 rendered rows for anything shaped like a
+        // `~/...` path, stat it, and adopt the DEEPEST match as the working
+        // directory -- immediately, with no confirmation. Claude's output is
+        // full of paths, so any file it mentioned re-rooted the tree, and the
+        // re-root walks the filesystem on the event-loop thread. Observed
+        // hanging Canopy outright: a sample showed the main thread with 1,224
+        // of 1,770 frames in readdir_r and 458 in stat.
+        //
+        // It existed to answer "which directory is Claude working in", which
+        // the session transcript now reports directly and correctly (see
+        // src/activity.rs). OSC 7 and the process-cwd check above remain as
+        // the legitimate signals for a shell that actually cds.
     }
 
     pub fn is_process_exited(&self) -> bool {
@@ -635,7 +552,6 @@ pub fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
 }
 
 impl TerminalPane {
-
     /// Send pasted text wrapped in bracketed-paste escape sequences.
     /// This prevents the terminal from interpreting newlines as Enter keypresses.
     pub fn handle_paste(&mut self, text: String) {
@@ -688,13 +604,14 @@ impl TerminalPane {
 
     /// Extract text from a selection range (terminal-local coordinates).
     /// Coordinates are (col, row) relative to the visible terminal area.
-    pub fn extract_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
+    /// Text between two ABSOLUTE line positions. Taking screen rows here meant
+    /// the copied text drifted away from the highlighted text as soon as the
+    /// view scrolled.
+    pub fn extract_text(&self, start: (u16, u64), end: (u16, u64)) -> String {
         let vt = lock_or_recover(&self.vterm);
         let grid = vt.grid();
         let scrollback = vt.scrollback();
-        let scroll_offset = vt.scroll_offset();
         let cols = vt.cols();
-        let total_lines = scrollback.len() + grid.len();
 
         // Normalize start/end so start is before end
         let (start, end) = if (start.1, start.0) <= (end.1, end.0) {
@@ -703,20 +620,13 @@ impl TerminalPane {
             (end, start)
         };
 
-        let visible_height = grid.len();
-        // Map screen row to absolute line index in scrollback+grid
-        let abs_line = |screen_row: u16| -> usize {
-            if scroll_offset == 0 {
-                scrollback.len() + screen_row as usize
-            } else {
-                let bottom = total_lines.saturating_sub(scroll_offset);
-                let top = bottom.saturating_sub(visible_height);
-                top + screen_row as usize
-            }
-        };
+        // Absolute -> index into the virtual `scrollback ++ grid` buffer.
+        // Lines evicted since the selection was made are simply gone.
+        let evicted = vt.lines_evicted();
+        let to_view = |abs: u64| -> usize { abs.saturating_sub(evicted) as usize };
 
-        let start_line = abs_line(start.1);
-        let end_line = abs_line(end.1);
+        let start_line = to_view(start.1);
+        let end_line = to_view(end.1);
 
         let get_row = |line_idx: usize| -> Option<&Vec<crate::vterm::Cell>> {
             if line_idx < scrollback.len() {
@@ -900,7 +810,7 @@ mod key_tests {
     fn control_bytes_round_trip_exactly() {
         let ctrl = KeyModifiers::CONTROL;
         for (ch, want) in [
-            (' ', 0x00u8),  // Ctrl+Space, set mark
+            (' ', 0x00u8), // Ctrl+Space, set mark
             ('a', 0x01),
             ('z', 0x1a),
             ('[', 0x1b),
@@ -935,7 +845,10 @@ mod key_tests {
     #[test]
     fn ctrl_shift_is_not_sent_as_a_bare_letter() {
         // CONTROL|SHIFT fell through to the UTF-8 branch and sent "C".
-        let got = enc(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let got = enc(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
         assert_eq!(got, vec![0x03]);
     }
 

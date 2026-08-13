@@ -80,7 +80,11 @@ fn config_dir() -> Option<PathBuf> {
 }
 
 fn projects_dir(root: &Path) -> Option<PathBuf> {
-    Some(config_dir()?.join("projects").join(mangle_project_path(root)))
+    Some(
+        config_dir()?
+            .join("projects")
+            .join(mangle_project_path(root)),
+    )
 }
 
 /// Fallback when the mangled directory does not exist: scan every project
@@ -109,7 +113,9 @@ fn find_by_cwd(root: &Path) -> Option<PathBuf> {
             }
             // Only the first line is read, so this stays cheap even though some
             // transcripts are megabytes.
-            let Ok(file) = File::open(&path) else { continue };
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
             let mut first = String::new();
             if BufReader::new(file).read_line(&mut first).is_err() {
                 continue;
@@ -340,7 +346,7 @@ impl ActivityWatcher {
             // split() strips the delimiter, so account for it separately. If
             // the final chunk has no newline it is a partial write; leave it
             // for the next poll rather than parsing half a record.
-            let is_complete = self.offset + consumed + bytes.len() as u64 + 1 <= len;
+            let is_complete = self.offset + consumed + (bytes.len() as u64) < len;
             if !is_complete {
                 break;
             }
@@ -422,10 +428,7 @@ mod tests {
             mangle_project_path(Path::new("/Users/me/_scratch/my proj")),
             "-Users-me--scratch-my-proj"
         );
-        assert_eq!(
-            mangle_project_path(Path::new("/tmp/a@b.c")),
-            "-tmp-a-b-c"
-        );
+        assert_eq!(mangle_project_path(Path::new("/tmp/a@b.c")), "-tmp-a-b-c");
     }
 
     #[test]
@@ -460,7 +463,10 @@ mod tests {
         let read = br#"{"message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/r/a.rs"}}]}}"#;
         let write = br#"{"message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/b.rs"}}]}}"#;
         assert_eq!(parse_line(read, root).unwrap()[0].kind, ActivityKind::Read);
-        assert_eq!(parse_line(write, root).unwrap()[0].kind, ActivityKind::Write);
+        assert_eq!(
+            parse_line(write, root).unwrap()[0].kind,
+            ActivityKind::Write
+        );
     }
 
     #[test]
@@ -519,7 +525,10 @@ mod tests {
 
         // Starting mid-file: history is not activity, so this must be ignored.
         let mut w = ActivityWatcher::with_transcript(root, transcript.clone(), false);
-        assert!(poll_now(&mut w).is_empty(), "existing lines must not replay");
+        assert!(
+            poll_now(&mut w).is_empty(),
+            "existing lines must not replay"
+        );
 
         let touched = root.join("src/main.rs");
         write_line(&transcript, "Edit", touched.to_str().unwrap());

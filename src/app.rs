@@ -11,11 +11,19 @@ const REFRESH_THROTTLE: Duration = Duration::from_millis(250);
 
 use crate::activity::{ActivityKind, ActivityWatcher};
 use crate::terminal::TerminalPane;
+use crate::tree::FileNode;
 use crate::tree::FileTree;
 
+/// A selection anchored to the TEXT, not to the screen.
+///
+/// Screen rows move under the content whenever the view scrolls, so a
+/// viewport-relative selection highlights different text after every wheel
+/// tick and copies something other than what is highlighted. Absolute line
+/// numbers (see `VirtualTerminal::absolute_line`) stay attached to the line
+/// the user actually dragged over.
 pub struct Selection {
-    pub start: (u16, u16), // (col, row) terminal-local coordinates
-    pub end: (u16, u16),
+    pub start: (u16, u64), // (col, absolute line)
+    pub end: (u16, u64),
 }
 
 pub struct App {
@@ -26,6 +34,10 @@ pub struct App {
     pub tree_area: Option<Rect>,
     pub terminal_area: Option<Rect>,
     pub selection: Option<Selection>,
+    /// Where the button went down. A selection only exists once the pointer
+    /// actually moves — otherwise a plain click would leave a one-cell
+    /// highlight that nothing clears.
+    drag_anchor: Option<(u16, u64)>,
     pub last_auto_scroll_cwd: Option<PathBuf>,
     /// Follows Claude's session transcript.
     pub activity: ActivityWatcher,
@@ -38,6 +50,20 @@ pub struct App {
     last_refresh: Instant,
     refresh_queued: bool,
     reveal_attempts: u8,
+    /// Completed walks arrive here from `spawn_blocking`. The walk is unbounded
+    /// I/O and must never run on the event-loop thread.
+    walk_rx: mpsc::UnboundedReceiver<WalkResult>,
+    walk_tx: mpsc::UnboundedSender<WalkResult>,
+    /// One walk at a time. Without this, a burst of events queues N walks and
+    /// the last N-1 are wasted work against a tree that already changed.
+    walk_in_flight: bool,
+}
+
+/// A finished walk, tagged with the root it was for so a result that arrives
+/// after the tree re-roots can be discarded instead of showing the wrong tree.
+struct WalkResult {
+    root: PathBuf,
+    nodes: Vec<FileNode>,
 }
 
 impl App {
@@ -58,6 +84,7 @@ impl App {
         // user is waiting for; the tree can arrive a few milliseconds later.
         let terminal = TerminalPane::new(&canonical_path, &claude_args, pty_tx)?;
         let tree = FileTree::new(&canonical_path, show_hidden, max_depth)?;
+        let (walk_tx, walk_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             tree,
@@ -67,13 +94,20 @@ impl App {
             tree_area: None,
             terminal_area: None,
             selection: None,
+            drag_anchor: None,
             last_auto_scroll_cwd: None,
-            activity: ActivityWatcher::new(&canonical_path, std::env::var("CANOPY_SESSION_ID").ok()),
+            activity: ActivityWatcher::new(
+                &canonical_path,
+                std::env::var("CANOPY_SESSION_ID").ok(),
+            ),
             highlight: None,
             pending_reveal: None,
             last_refresh: Instant::now(),
             refresh_queued: false,
             reveal_attempts: 0,
+            walk_rx,
+            walk_tx,
+            walk_in_flight: false,
         })
     }
 
@@ -86,9 +120,11 @@ impl App {
             self.tree.set_root(cwd.clone());
             self.activity.set_root(cwd);
             self.last_auto_scroll_cwd = None;
+            // set_root no longer walks; schedule it off-thread.
+            self.request_refresh();
         }
 
-        self.flush_queued_refresh();
+        self.drain_walks();
         self.poll_activity();
 
         // Process clipboard requests from vterm (OSC 52)
@@ -98,29 +134,54 @@ impl App {
                 copy_to_clipboard(&text);
             }
         }
-        if self.tree_loading {
-            self.tree_loading = false;
-        }
         self.terminal.is_process_exited()
     }
 
-    /// Rebuild the tree, but never more than once per REFRESH_THROTTLE. Bursts
-    /// coalesce into a single walk on a later tick.
+    /// Rebuild the tree OFF the event-loop thread, at most once per
+    /// REFRESH_THROTTLE, and never more than one at a time. Bursts coalesce.
     fn request_refresh(&mut self) {
-        if self.last_refresh.elapsed() >= REFRESH_THROTTLE {
-            self.tree.refresh();
-            self.last_refresh = Instant::now();
-            self.refresh_queued = false;
-        } else {
+        if self.walk_in_flight || self.last_refresh.elapsed() < REFRESH_THROTTLE {
             self.refresh_queued = true;
+            return;
         }
+        self.spawn_walk();
     }
 
-    fn flush_queued_refresh(&mut self) {
-        if self.refresh_queued && self.last_refresh.elapsed() >= REFRESH_THROTTLE {
-            self.tree.refresh();
-            self.last_refresh = Instant::now();
-            self.refresh_queued = false;
+    fn spawn_walk(&mut self) {
+        let root = self.tree.root_path().to_path_buf();
+        let show_hidden = self.tree.show_hidden();
+        let max_depth = self.tree.max_depth();
+        let tx = self.walk_tx.clone();
+
+        self.walk_in_flight = true;
+        self.refresh_queued = false;
+        self.last_refresh = Instant::now();
+        self.tree_loading = true;
+
+        // spawn_blocking, not spawn: this is blocking filesystem I/O. On the
+        // current_thread runtime a blocking call in ANY task stalls every other
+        // task, including the one reading the keyboard.
+        tokio::task::spawn_blocking(move || {
+            let nodes = crate::tree::walk(&root, show_hidden, max_depth);
+            let _ = tx.send(WalkResult { root, nodes });
+        });
+    }
+
+    /// Take any finished walk and start a queued one. Called from tick().
+    fn drain_walks(&mut self) {
+        while let Ok(result) = self.walk_rx.try_recv() {
+            self.walk_in_flight = false;
+            // Discard a result for a root we have since moved away from.
+            if result.root == self.tree.root_path() {
+                self.tree.set_nodes(result.nodes);
+                self.tree_loading = false;
+            }
+        }
+        if self.refresh_queued
+            && !self.walk_in_flight
+            && self.last_refresh.elapsed() >= REFRESH_THROTTLE
+        {
+            self.spawn_walk();
         }
     }
 
@@ -210,46 +271,59 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if in_terminal {
-                    let area = self.terminal_area.unwrap();
-                    let col = event.column.saturating_sub(area.x);
-                    let row = event.row.saturating_sub(area.y);
-                    self.selection = Some(Selection {
-                        start: (col, row),
-                        end: (col, row),
-                    });
+                // Pressing anywhere clears the previous selection, as every
+                // terminal does. The anchor is remembered, but no selection
+                // exists until the pointer actually moves.
+                self.selection = None;
+                self.drag_anchor = if in_terminal {
+                    self.terminal_point(event.column, event.row)
                 } else {
-                    self.selection = None;
-                }
+                    None
+                };
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(ref mut sel) = self.selection {
-                    if let Some(area) = self.terminal_area {
-                        let col = event
-                            .column
-                            .saturating_sub(area.x)
-                            .min(area.width.saturating_sub(1));
-                        let row = event
-                            .row
-                            .saturating_sub(area.y)
-                            .min(area.height.saturating_sub(1));
-                        sel.end = (col, row);
+                if let Some(anchor) = self.drag_anchor {
+                    if let Some(point) = self.terminal_point(event.column, event.row) {
+                        if point != anchor {
+                            self.selection = Some(Selection {
+                                start: anchor,
+                                end: point,
+                            });
+                        } else {
+                            self.selection = None;
+                        }
                     }
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                self.drag_anchor = None;
                 if let Some(sel) = self.selection.as_ref() {
-                    // Only copy if the selection spans more than a single point
-                    if sel.start != sel.end {
-                        let text = self.terminal.extract_text(sel.start, sel.end);
-                        if !text.is_empty() {
-                            copy_to_clipboard(&text);
-                        }
+                    let text = self.terminal.extract_text(sel.start, sel.end);
+                    if !text.is_empty() {
+                        copy_to_clipboard(&text);
                     }
                 }
             }
             _ => {}
         }
+    }
+
+    /// Map a mouse position to (column, absolute line), clamped to the pane.
+    /// Returns None when the pointer is outside the terminal pane.
+    fn terminal_point(&self, column: u16, row: u16) -> Option<(u16, u64)> {
+        let area = self.terminal_area?;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        let col = column
+            .saturating_sub(area.x)
+            .min(area.width.saturating_sub(1));
+        let screen_row = row
+            .saturating_sub(area.y)
+            .min(area.height.saturating_sub(1));
+        let vt = self.terminal.vterm_lock();
+        let top = vt.top_view_index(area.height as usize);
+        Some((col, vt.absolute_line(top + screen_row as usize)))
     }
 
     pub fn handle_file_change(&mut self, path: PathBuf) {

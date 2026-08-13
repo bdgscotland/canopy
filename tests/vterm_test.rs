@@ -319,7 +319,7 @@ fn test_scroll_offset() {
         vt.feed(format!("{}\r\n", i).as_bytes());
     }
 
-    assert!(vt.scrollback().len() > 0);
+    assert!(!vt.scrollback().is_empty());
 
     vt.set_scroll_offset(3);
     assert_eq!(vt.scroll_offset(), 3);

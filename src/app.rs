@@ -9,6 +9,11 @@ use tokio::sync::mpsc;
 /// however many events arrive.
 const REFRESH_THROTTLE: Duration = Duration::from_millis(250);
 
+/// Give up waiting on a walk after this. spawn_blocking cannot be cancelled, so
+/// the task is orphaned rather than stopped -- but the tree stops being held
+/// hostage by it, and its late result is discarded by generation.
+const WALK_TIMEOUT: Duration = Duration::from_secs(10);
+
 use crate::activity::{ActivityKind, ActivityWatcher};
 use crate::terminal::TerminalPane;
 use crate::tree::FileNode;
@@ -59,6 +64,15 @@ pub struct App {
     walk_in_flight: bool,
     /// The terminal feed died but the session did not. Surfaced in the UI.
     pub reader_failed_notice: bool,
+    initial_walk_done: bool,
+    /// When the in-flight walk started, so a hung one cannot latch the tree
+    /// dead forever on an unresponsive mount.
+    walk_started: Option<Instant>,
+    /// Incremented per walk; results from an older generation are discarded.
+    walk_generation: u64,
+    /// A walk exceeded its timeout. Surfaced so a wedged mount is visible
+    /// rather than looking like a tree that simply stopped updating.
+    pub walk_stalled: bool,
 }
 
 /// A finished walk, tagged with the root it was for so a result that arrives
@@ -66,6 +80,7 @@ pub struct App {
 struct WalkResult {
     root: PathBuf,
     nodes: Vec<FileNode>,
+    generation: u64,
 }
 
 impl App {
@@ -92,10 +107,10 @@ impl App {
             tree,
             terminal,
             tree_width_percent: tree_width.clamp(10, 50),
-            // FileTree::new already walked synchronously above, so the tree is
-            // populated. Starting this true left "Scanning files..." on screen
-            // forever, because nothing spawns a walk at startup to clear it.
-            tree_loading: false,
+            // The tree starts EMPTY: FileTree::new no longer walks, so that
+            // uncapped I/O cannot run in raw mode before any frame or signal
+            // handler exists. The first tick spawns the real walk off-thread.
+            tree_loading: true,
             tree_area: None,
             terminal_area: None,
             selection: None,
@@ -114,6 +129,10 @@ impl App {
             walk_tx,
             walk_in_flight: false,
             reader_failed_notice: false,
+            initial_walk_done: false,
+            walk_started: None,
+            walk_generation: 0,
+            walk_stalled: false,
         })
     }
 
@@ -130,6 +149,12 @@ impl App {
             self.request_refresh();
         }
 
+        // Issue the initial walk on the first tick, once a frame has been
+        // painted and the event loop is serving input and signals.
+        if !self.initial_walk_done {
+            self.initial_walk_done = true;
+            self.request_refresh();
+        }
         self.drain_walks();
         self.poll_activity();
 
@@ -162,6 +187,19 @@ impl App {
     /// Rebuild the tree OFF the event-loop thread, at most once per
     /// REFRESH_THROTTLE, and never more than one at a time. Bursts coalesce.
     fn request_refresh(&mut self) {
+        // A walk on a hung mount never returns, and spawn_blocking cannot be
+        // cancelled. Without this the flag latches true and the tree is dead
+        // for the rest of the session. After the timeout we orphan that task
+        // and allow a new one; its result is discarded by generation.
+        if self.walk_in_flight
+            && self
+                .walk_started
+                .is_some_and(|t| t.elapsed() > WALK_TIMEOUT)
+        {
+            self.walk_in_flight = false;
+            self.tree_loading = false;
+            self.walk_stalled = true;
+        }
         if self.walk_in_flight || self.last_refresh.elapsed() < REFRESH_THROTTLE {
             self.refresh_queued = true;
             return;
@@ -181,6 +219,9 @@ impl App {
         self.walk_in_flight = true;
         self.refresh_queued = false;
         self.last_refresh = Instant::now();
+        self.walk_started = Some(Instant::now());
+        self.walk_generation += 1;
+        let generation = self.walk_generation;
         self.tree_loading = true;
 
         // spawn_blocking, not spawn: this is blocking filesystem I/O. On the
@@ -188,15 +229,25 @@ impl App {
         // task, including the one reading the keyboard.
         tokio::task::spawn_blocking(move || {
             let nodes = crate::tree::walk(&root, show_hidden, max_depth, &collapsed);
-            let _ = tx.send(WalkResult { root, nodes });
+            let _ = tx.send(WalkResult {
+                root,
+                nodes,
+                generation,
+            });
         });
     }
 
     /// Take any finished walk and start a queued one. Called from tick().
     fn drain_walks(&mut self) {
         while let Ok(result) = self.walk_rx.try_recv() {
+            // Ignore a straggler from a walk we already gave up on, or one for
+            // a root we have since moved away from.
+            if result.generation != self.walk_generation {
+                continue;
+            }
             self.walk_in_flight = false;
-            // Discard a result for a root we have since moved away from.
+            self.walk_started = None;
+            self.walk_stalled = false;
             if result.root == self.tree.root_path() {
                 self.tree.set_nodes(result.nodes);
                 self.tree_loading = false;
@@ -313,7 +364,11 @@ impl App {
                     if let Some(area) = self.tree_area {
                         let row = event.row.saturating_sub(area.y) as usize;
                         if let Some(path) = self.tree.node_at_row(row).map(|n| n.path.clone()) {
-                            self.tree.toggle(&path);
+                            if self.tree.toggle(&path) {
+                                // toggle() only updates the fold set; the walk
+                                // that applies it runs off-thread.
+                                self.request_refresh();
+                            }
                         }
                     }
                 }
@@ -449,25 +504,38 @@ fn try_clipboard_cmd(program: &str, args: &[&str], text: &str) -> bool {
 
 #[cfg(test)]
 mod loading_state_tests {
-    /// The startup value of `tree_loading` must match reality: FileTree::new
-    /// walks synchronously in the constructor, so the tree IS populated by the
-    /// time the first frame renders. Starting it true left "Scanning files..."
-    /// on screen forever, because nothing spawns a walk at startup to clear it,
-    /// and the loading branch REPLACED the tree instead of annotating it.
+    /// `tree_loading` must match what the constructor actually did.
     ///
-    /// This asserts the constructor's literal rather than building an App,
-    /// which would need a PTY and a live child.
+    /// This flag has now been wrong in BOTH directions, which is why it is
+    /// pinned. It started true while FileTree::new walked synchronously, so
+    /// "Scanning files..." stayed on screen forever over a populated tree.
+    /// FileTree::new no longer walks -- that uncapped I/O ran in raw mode with
+    /// no signal handler and no way to interrupt it -- so the tree really is
+    /// empty at construction and the flag must start true again, with the first
+    /// tick issuing the walk.
+    ///
+    /// Asserted against the source rather than by building an App, which needs
+    /// a PTY and a live child.
     #[test]
-    fn tree_loading_starts_false_because_the_constructor_already_walked() {
+    fn tree_loading_matches_what_the_constructor_actually_does() {
         let src = include_str!("app.rs");
         let ctor = src
             .split("Ok(Self {")
             .nth(1)
             .expect("App::new struct literal");
         assert!(
-            ctor.contains("tree_loading: false"),
-            "tree_loading must start false: FileTree::new already walked, and \
-             nothing clears it at startup"
+            ctor.contains("tree_loading: true"),
+            "the tree is empty at construction, so loading must start true"
+        );
+        assert!(
+            src.contains("initial_walk_done"),
+            "something must issue the first walk once the loop is running"
+        );
+        let tree_src = include_str!("tree/mod.rs");
+        assert!(
+            !tree_src.contains("tree.rebuild_visible_nodes()?;"),
+            "FileTree::new must NOT walk: it runs in raw mode with no signal \
+             handler, where only SIGKILL can interrupt it"
         );
     }
 

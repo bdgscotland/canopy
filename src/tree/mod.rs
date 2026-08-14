@@ -36,7 +36,7 @@ pub struct FileTree {
 
 impl FileTree {
     pub fn new(root: &Path, show_hidden: bool, max_depth: usize) -> Result<Self> {
-        let mut tree = Self {
+        let tree = Self {
             root: root.to_path_buf(),
             nodes: Vec::new(),
             show_hidden,
@@ -46,8 +46,22 @@ impl FileTree {
             collapsed: std::collections::HashSet::new(),
         };
 
-        tree.rebuild_visible_nodes()?;
-
+        // Deliberately NOT walked here.
+        //
+        // This used to walk synchronously, justified as "before the event loop
+        // exists". That was a category error: the hazard was never that the
+        // loop was running. By this point raw mode is on (so cfmakeraw has
+        // cleared ISIG and Ctrl-C is a 0x03 byte nobody reads), the alternate
+        // screen is blank, and no signal disposition exists yet. Uncapped
+        // blocking I/O in that window is only escapable with SIGKILL from
+        // another terminal.
+        //
+        // Measured: this repo 0.7-1.5 ms, but $HOME at depth 5 is 416 ms,
+        // ~/Developer at depth 10 is 699 ms, and on a cold cache or an NFS or
+        // SMB mount there is no ceiling at all.
+        //
+        // The caller draws a frame first, then issues the initial walk through
+        // the same spawn_walk path, with the same caps as every other walk.
         Ok(tree)
     }
 
@@ -67,20 +81,13 @@ impl FileTree {
         self.offset = offset;
     }
 
-    /// The ONLY synchronous walk left, and it runs once at construction before
-    /// the event loop exists. Every later walk goes through spawn_blocking.
-    fn rebuild_visible_nodes(&mut self) -> Result<()> {
-        self.nodes = walk(
-            &self.root,
-            self.show_hidden,
-            self.max_depth,
-            &self.collapsed,
-        );
-        Ok(())
-    }
-
-    /// Toggle a directory open or closed. Returns false for a file, so callers
-    /// can tell a no-op from a change worth redrawing for.
+    /// Toggle a directory open or closed. Returns true when the fold state
+    /// changed, so the caller knows to schedule a walk.
+    ///
+    /// Deliberately does NOT walk: this is called from the mouse handler on the
+    /// event-loop thread, and walking there is the hazard the whole
+    /// spawn_blocking arrangement exists to remove. The caller issues the walk;
+    /// the fold appears when it lands.
     pub fn toggle(&mut self, path: &Path) -> bool {
         let Some(node) = self.nodes.iter().find(|n| n.path == path) else {
             return false;
@@ -92,7 +99,6 @@ impl FileTree {
         if !self.collapsed.remove(&path) {
             self.collapsed.insert(path);
         }
-        let _ = self.rebuild_visible_nodes();
         true
     }
 
@@ -380,7 +386,16 @@ mod noise_tests {
 }
 
 #[cfg(test)]
+fn built_local(root: &std::path::Path, hidden: bool, depth: usize) -> FileTree {
+    let mut t = FileTree::new(root, hidden, depth).unwrap();
+    let nodes = walk(root, hidden, depth, t.collapsed_set());
+    t.set_nodes(nodes);
+    t
+}
+
+#[cfg(test)]
 mod walk_tests {
+    use super::built_local;
     use super::*;
 
     /// Deterministic fixture exercising ordering, nesting, connectors and
@@ -443,7 +458,7 @@ mod walk_tests {
     #[test]
     fn walk_output_is_stable() {
         let d = fixture();
-        let tree = FileTree::new(d.path(), false, 10).unwrap();
+        let tree = built_local(d.path(), false, 10);
         let got = render(&tree);
 
         // dirs before files, case-insensitive within each group, gitignore
@@ -484,22 +499,23 @@ mod walk_tests {
     #[test]
     fn max_depth_is_respected() {
         let d = fixture();
-        let shallow = FileTree::new(d.path(), false, 2).unwrap();
+        let shallow = built_local(d.path(), false, 2);
         assert!(shallow.nodes().iter().all(|n| n.depth <= 2));
-        let deep = FileTree::new(d.path(), false, 10).unwrap();
+        let deep = built_local(d.path(), false, 10);
         assert!(deep.nodes().len() > shallow.nodes().len());
     }
 }
 
 #[cfg(test)]
 mod visibility_tests {
+    use super::built_local;
     use super::*;
 
     fn tree_with(hidden: bool, depth: usize) -> (tempfile::TempDir, FileTree) {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("src/a/b/c")).unwrap();
         std::fs::create_dir_all(d.path().join(".github/workflows")).unwrap();
-        let t = FileTree::new(d.path(), hidden, depth).unwrap();
+        let t = built_local(d.path(), hidden, depth);
         (d, t)
     }
 
@@ -532,6 +548,7 @@ mod visibility_tests {
 
 #[cfg(test)]
 mod collapse_tests {
+    use super::built_local;
     use super::*;
 
     fn fixture() -> tempfile::TempDir {
@@ -550,7 +567,7 @@ mod collapse_tests {
     #[test]
     fn collapsing_a_directory_hides_its_children() {
         let d = fixture();
-        let mut t = FileTree::new(d.path(), false, 10).unwrap();
+        let mut t = built_local(d.path(), false, 10);
         let before = t.nodes().len();
         assert!(t.nodes().iter().any(|n| n.name == "main.rs"));
 
@@ -559,6 +576,11 @@ mod collapse_tests {
             "toggling a dir must report a change"
         );
         assert!(t.is_collapsed(&d.path().join("src")));
+        // toggle() only records the fold; the walk that applies it runs
+        // off-thread, because walking from the mouse handler is the hazard the
+        // whole spawn_blocking arrangement exists to remove.
+        let nodes = walk(d.path(), false, 10, t.collapsed_set());
+        t.set_nodes(nodes);
         assert!(
             !t.nodes().iter().any(|n| n.name == "main.rs"),
             "children still shown"
@@ -579,13 +601,15 @@ mod collapse_tests {
 
         assert!(t.toggle(&d.path().join("src")));
         assert!(!t.is_collapsed(&d.path().join("src")));
+        let nodes = walk(d.path(), false, 10, t.collapsed_set());
+        t.set_nodes(nodes);
         assert_eq!(t.nodes().len(), before, "reopening must restore exactly");
     }
 
     #[test]
     fn toggling_a_file_does_nothing() {
         let d = fixture();
-        let mut t = FileTree::new(d.path(), false, 10).unwrap();
+        let mut t = built_local(d.path(), false, 10);
         let before = t.nodes().len();
         assert!(!t.toggle(&d.path().join("src/main.rs")));
         assert_eq!(t.nodes().len(), before);
@@ -596,10 +620,15 @@ mod collapse_tests {
     #[test]
     fn fold_state_survives_a_rescan() {
         let d = fixture();
-        let mut t = FileTree::new(d.path(), false, 10).unwrap();
+        let mut t = built_local(d.path(), false, 10);
         t.toggle(&d.path().join("src"));
+        // Apply the fold, as the off-thread walk would.
+        let nodes = walk(d.path(), false, 10, t.collapsed_set());
+        t.set_nodes(nodes);
         let folded = t.nodes().len();
 
+        // A LATER rescan -- triggered by a filesystem event, say -- must not
+        // quietly re-open what the user closed.
         let nodes = walk(d.path(), false, 10, t.collapsed_set());
         assert_eq!(
             nodes.len(),
@@ -612,7 +641,7 @@ mod collapse_tests {
     #[test]
     fn node_at_row_accounts_for_scrolling() {
         let d = fixture();
-        let mut t = FileTree::new(d.path(), false, 10).unwrap();
+        let mut t = built_local(d.path(), false, 10);
         let first = t.node_at_row(0).unwrap().path.clone();
         assert_eq!(first, t.root_path());
         t.set_offset(2);

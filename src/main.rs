@@ -235,30 +235,47 @@ async fn run_app(
     app: &mut App,
     mut event_handler: EventHandler,
 ) -> Result<()> {
-    loop {
-        // Draw UI
-        terminal.draw(|frame| ui::draw(frame, app))?;
+    // Draw once so there is something on screen before the first event.
+    terminal.draw(|frame| ui::draw(frame, app))?;
 
-        // Handle events
+    loop {
+        // Only redraw when something changed.
+        //
+        // This used to draw unconditionally at the top of every iteration, so
+        // EVERY event cost a full frame -- and event.rs fans out one FileChange
+        // per path into an unbounded channel, so a cargo build meant thousands
+        // of frames. Frames are cheap (76 us) but they are serialised with
+        // input on one thread, so a keystroke queued behind N of them waits.
+        let mut dirty = false;
+
         match event_handler.next().await? {
             event::Event::Tick => {
                 if app.tick() {
                     return Ok(());
                 }
                 event_handler.update_watch_path(Some(app.tree.root_path().to_path_buf()));
+                dirty = true;
             }
             event::Event::Key(key_event) => {
                 if app.handle_key(key_event) {
                     return Ok(());
                 }
+                // The echo arrives as PtyOutput, but repaint anyway so local
+                // state (a cleared selection) is reflected immediately.
+                dirty = true;
             }
             event::Event::Mouse(mouse_event) => {
                 app.handle_mouse(mouse_event);
+                dirty = true;
             }
             event::Event::Paste(text) => {
                 app.handle_paste(text);
             }
-            event::Event::Resize(_width, _height) => {}
+            event::Event::Resize(_width, _height) => {
+                // The resize itself is applied inside ui::draw, so this must
+                // repaint even though the arm looks empty.
+                dirty = true;
+            }
             event::Event::FocusGained => {
                 app.terminal.send_focus_event(true);
             }
@@ -266,14 +283,24 @@ async fn run_app(
                 app.terminal.send_focus_event(false);
             }
             event::Event::FileChange(path) => {
+                // Deliberately NOT dirty. A filesystem event does not change
+                // what is on screen -- it schedules a walk, and the frame that
+                // shows the result is drawn when that walk lands, on a tick.
+                // This is the fan-out that made a cargo build cost thousands
+                // of frames.
                 app.handle_file_change(path);
             }
             event::Event::PtyOutput => {
-                // vterm already updated by the reader thread; just redraw on next loop iteration
+                // Claude drew something.
+                dirty = true;
             }
             event::Event::Signal => {
                 return Ok(());
             }
+        }
+
+        if dirty {
+            terminal.draw(|frame| ui::draw(frame, app))?;
         }
     }
 }

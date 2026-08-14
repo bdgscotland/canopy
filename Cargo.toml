@@ -5,8 +5,8 @@ edition = "2021"
 authors = ["Duncan Bowring"]
 description = "A project tree that follows Claude Code as it works"
 license = "MIT"
-repository = "https://github.com/duncanbowring/canopy"
-homepage = "https://github.com/duncanbowring/canopy"
+repository = "https://github.com/bdgscotland/canopy"
+homepage = "https://github.com/bdgscotland/canopy"
 keywords = ["cli", "tui", "file-explorer", "claude", "terminal"]
 categories = ["command-line-utilities", "development-tools"]
 

@@ -158,24 +158,22 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
             }
         }
 
-        // Show scroll indicator if needed
-        if nodes.len() > visible_height {
-            let scrollbar_height =
-                visible_height as f32 / nodes.len() as f32 * visible_height as f32;
-            let scrollbar_height = scrollbar_height.max(1.0) as u16;
-            let scrollbar_pos =
-                (state.offset as f32 / nodes.len() as f32 * visible_height as f32) as u16;
-
+        // Scrollbar. Geometry comes from FileTree so the thumb is drawn
+        // exactly where the mouse handler thinks it is -- the old version
+        // computed its own position, which would have made a drag land
+        // somewhere other than where the user grabbed.
+        if let Some((thumb_pos, thumb_height)) = self.tree.scrollbar_thumb(visible_height) {
             let scrollbar_x = area.x + area.width - 1;
-            for y in 0..visible_height as u16 {
-                let ch = if y >= scrollbar_pos && y < scrollbar_pos + scrollbar_height {
-                    "█"
-                } else {
-                    "░"
-                };
-                if let Some(cell) = buf.cell_mut((scrollbar_x, area.y + y)) {
+            for y in 0..visible_height {
+                let on_thumb = y >= thumb_pos && y < thumb_pos + thumb_height;
+                let ch = if on_thumb { "█" } else { "░" };
+                if let Some(cell) = buf.cell_mut((scrollbar_x, area.y + y as u16)) {
                     cell.set_symbol(ch);
-                    cell.set_fg(Color::DarkGray);
+                    cell.set_fg(if on_thumb {
+                        Color::Gray
+                    } else {
+                        Color::DarkGray
+                    });
                 }
             }
         }

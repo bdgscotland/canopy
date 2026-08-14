@@ -43,6 +43,10 @@ pub struct App {
     /// actually moves — otherwise a plain click would leave a one-cell
     /// highlight that nothing clears.
     drag_anchor: Option<(u16, u64)>,
+    /// Grab offset within the scrollbar thumb, so a drag moves the thumb
+    /// relative to where it was grabbed rather than snapping its top to the
+    /// pointer.
+    scrollbar_grab: Option<usize>,
     pub last_auto_scroll_cwd: Option<PathBuf>,
     /// Follows Claude's session transcript.
     pub activity: ActivityWatcher,
@@ -115,6 +119,7 @@ impl App {
             terminal_area: None,
             selection: None,
             drag_anchor: None,
+            scrollbar_grab: None,
             last_auto_scroll_cwd: None,
             activity: ActivityWatcher::new(
                 &canonical_path,
@@ -363,17 +368,46 @@ impl App {
                 if in_tree {
                     if let Some(area) = self.tree_area {
                         let row = event.row.saturating_sub(area.y) as usize;
-                        if let Some(path) = self.tree.node_at_row(row).map(|n| n.path.clone()) {
-                            if self.tree.toggle(&path) {
-                                // toggle() only updates the fold set; the walk
-                                // that applies it runs off-thread.
-                                self.request_refresh();
+                        let visible = area.height as usize;
+                        let thumb = self.tree.scrollbar_thumb(visible);
+                        let on_scrollbar =
+                            area.width > 0 && event.column == area.x + area.width - 1;
+
+                        match (on_scrollbar, thumb) {
+                            // Grabbed the thumb: remember where within it, so
+                            // it does not jump under the cursor on the drag.
+                            (true, Some((pos, height))) if row >= pos && row < pos + height => {
+                                self.scrollbar_grab = Some(row - pos);
+                            }
+                            // Clicked the track: page toward the click, which
+                            // is what every scrollbar does.
+                            (true, Some((pos, _))) => self.tree.page(row > pos, visible),
+                            // Anywhere else: fold or unfold the row.
+                            _ => {
+                                if let Some(path) =
+                                    self.tree.node_at_row(row).map(|n| n.path.clone())
+                                {
+                                    if self.tree.toggle(&path) {
+                                        // toggle() only records the fold; the
+                                        // walk that applies it runs off-thread.
+                                        self.request_refresh();
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                // Dragging the scrollbar thumb.
+                if let Some(grab) = self.scrollbar_grab {
+                    if let Some(area) = self.tree_area {
+                        let row = event.row.saturating_sub(area.y) as usize;
+                        self.tree
+                            .scroll_to_thumb_row(row.saturating_sub(grab), area.height as usize);
+                    }
+                    return;
+                }
                 if let Some(anchor) = self.drag_anchor {
                     if let Some(point) = self.terminal_point(event.column, event.row) {
                         if point != anchor {
@@ -389,6 +423,7 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag_anchor = None;
+                self.scrollbar_grab = None;
                 if let Some(sel) = self.selection.as_ref() {
                     let text = self.terminal.extract_text(sel.start, sel.end);
                     if !text.is_empty() {

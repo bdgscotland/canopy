@@ -96,7 +96,17 @@ impl FileTree {
             return false;
         }
         let path = path.to_path_buf();
-        if !self.collapsed.remove(&path) {
+        let is_root = path == self.root;
+        if self.collapsed.contains(&path) {
+            // Reopening unfolds only this directory. Reopening the root shows
+            // the top level with its children still folded, which is the point
+            // of folding the root in the first place.
+            self.collapsed.remove(&path);
+        } else if is_root {
+            // Folding the root folds everything, so reopening it shows the
+            // top level rather than the whole tree again.
+            self.collapse_recursive(&path);
+        } else {
             self.collapsed.insert(path);
         }
         true
@@ -104,6 +114,72 @@ impl FileTree {
 
     pub fn is_collapsed(&self, path: &Path) -> bool {
         self.collapsed.contains(path)
+    }
+
+    /// Where the scrollbar thumb sits, as (first_row, height) in viewport
+    /// rows, or None when everything fits and no scrollbar is drawn.
+    ///
+    /// Shared by the renderer and the mouse handler deliberately: two copies of
+    /// this arithmetic would drift, and the click would stop landing where the
+    /// thumb is drawn.
+    pub fn scrollbar_thumb(&self, visible_height: usize) -> Option<(usize, usize)> {
+        let total = self.nodes.len();
+        if visible_height == 0 || total <= visible_height {
+            return None;
+        }
+        let height = ((visible_height * visible_height) / total).max(1);
+        let max_offset = total.saturating_sub(visible_height);
+        let travel = visible_height.saturating_sub(height);
+        let pos = if max_offset == 0 {
+            0
+        } else {
+            (self.offset * travel) / max_offset
+        };
+        Some((pos.min(travel), height))
+    }
+
+    /// Scroll so the thumb's TOP lands on `row`, clamped. Used for a drag.
+    pub fn scroll_to_thumb_row(&mut self, row: usize, visible_height: usize) {
+        let total = self.nodes.len();
+        if visible_height == 0 || total <= visible_height {
+            return;
+        }
+        let Some((_, height)) = self.scrollbar_thumb(visible_height) else {
+            return;
+        };
+        let max_offset = total.saturating_sub(visible_height);
+        let travel = visible_height.saturating_sub(height);
+        self.offset = if travel == 0 {
+            0
+        } else {
+            (row.min(travel) * max_offset) / travel
+        };
+    }
+
+    /// Page up or down, for a click on the scrollbar track above or below the
+    /// thumb -- what every scrollbar does.
+    pub fn page(&mut self, down: bool, visible_height: usize) {
+        let max_offset = self.nodes.len().saturating_sub(visible_height);
+        self.offset = if down {
+            (self.offset + visible_height).min(max_offset)
+        } else {
+            self.offset.saturating_sub(visible_height)
+        };
+    }
+
+    /// Collapse a directory and every directory beneath it.
+    ///
+    /// Folding the root should fold the whole tree, not just hide it: when the
+    /// root is reopened the user expects to see top-level entries, not the
+    /// fully-expanded tree they just closed.
+    pub fn collapse_recursive(&mut self, path: &Path) {
+        let descendants: Vec<PathBuf> = self
+            .nodes
+            .iter()
+            .filter(|n| n.is_dir && n.path.starts_with(path))
+            .map(|n| n.path.clone())
+            .collect();
+        self.collapsed.extend(descendants);
     }
 
     /// The node at a viewport row, accounting for the scroll offset.
@@ -199,7 +275,9 @@ pub fn walk(
         true,
         vec![],
     ));
-    if is_dir {
+    // The root's own fold was not honoured here -- only its descendants' --
+    // so collapsing the repo name still listed the top level.
+    if is_dir && !collapsed.contains(root) {
         emit_children(&mut nodes, root, 1, &[], &children, collapsed);
     }
     nodes
@@ -648,5 +726,167 @@ mod collapse_tests {
         let shifted = t.node_at_row(0).unwrap().path.clone();
         assert_ne!(shifted, first, "clicking must follow the scroll offset");
         assert_eq!(shifted, t.nodes()[2].path);
+    }
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::*;
+
+    fn tall(n: usize) -> (tempfile::TempDir, FileTree) {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..n {
+            std::fs::write(d.path().join(format!("f{i:03}.txt")), "x").unwrap();
+        }
+        let t = built_local(d.path(), false, 10);
+        (d, t)
+    }
+
+    #[test]
+    fn no_thumb_when_everything_fits() {
+        let (_d, t) = tall(5);
+        assert!(
+            t.scrollbar_thumb(50).is_none(),
+            "no scrollbar when it all fits"
+        );
+        assert!(
+            t.scrollbar_thumb(0).is_none(),
+            "no scrollbar in zero height"
+        );
+    }
+
+    /// The renderer and the mouse handler share this arithmetic on purpose. Two
+    /// copies would drift and the drag would stop landing where the thumb is.
+    #[test]
+    fn the_thumb_stays_inside_the_track_at_every_offset() {
+        let (_d, mut t) = tall(200);
+        let visible = 20;
+        let max_offset = t.nodes().len() - visible;
+        for offset in 0..=max_offset {
+            t.set_offset(offset);
+            let (pos, height) = t.scrollbar_thumb(visible).expect("thumb");
+            assert!(height >= 1, "thumb must be visible");
+            assert!(
+                pos + height <= visible,
+                "thumb ran past the track at offset {offset}: {pos}+{height} > {visible}"
+            );
+        }
+    }
+
+    #[test]
+    fn dragging_the_thumb_to_the_ends_reaches_the_ends() {
+        let (_d, mut t) = tall(200);
+        let visible = 20;
+        let max_offset = t.nodes().len() - visible;
+
+        t.scroll_to_thumb_row(0, visible);
+        assert_eq!(t.offset(), 0, "dragging to the top must show the first row");
+
+        t.scroll_to_thumb_row(visible, visible);
+        assert_eq!(
+            t.offset(),
+            max_offset,
+            "dragging to the bottom must show the last row"
+        );
+    }
+
+    #[test]
+    fn a_drag_round_trips_through_the_thumb_position() {
+        // Grab the thumb, move it, and the thumb should follow the pointer.
+        let (_d, mut t) = tall(200);
+        let visible = 20;
+        for target in [0usize, 3, 7, 11, 15] {
+            t.scroll_to_thumb_row(target, visible);
+            let (pos, _) = t.scrollbar_thumb(visible).expect("thumb");
+            let drift = pos.abs_diff(target);
+            assert!(
+                drift <= 1,
+                "thumb landed at {pos} for a drag to {target} (drift {drift})"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_the_track_pages() {
+        let (_d, mut t) = tall(200);
+        let visible = 20;
+        t.page(true, visible);
+        assert_eq!(t.offset(), visible, "page down moves one screen");
+        t.page(false, visible);
+        assert_eq!(t.offset(), 0, "page up returns");
+        // And cannot run off either end.
+        for _ in 0..50 {
+            t.page(true, visible);
+        }
+        assert_eq!(t.offset(), t.nodes().len() - visible);
+        for _ in 0..50 {
+            t.page(false, visible);
+        }
+        assert_eq!(t.offset(), 0);
+    }
+}
+
+#[cfg(test)]
+mod recursive_collapse_tests {
+    use super::*;
+
+    fn nested() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        for p in ["a/b/c", "x/y", "z"] {
+            std::fs::create_dir_all(d.path().join(p)).unwrap();
+        }
+        std::fs::write(d.path().join("a/b/c/deep.rs"), "x").unwrap();
+        std::fs::write(d.path().join("x/y/mid.rs"), "x").unwrap();
+        std::fs::write(d.path().join("z/leaf.rs"), "x").unwrap();
+        d
+    }
+
+    fn rewalk(t: &mut FileTree, root: &Path) {
+        let nodes = walk(root, false, 10, t.collapsed_set());
+        t.set_nodes(nodes);
+    }
+
+    /// Folding the root folds everything beneath it, so reopening shows the top
+    /// level rather than the fully-expanded tree you just closed.
+    #[test]
+    fn collapsing_the_root_collapses_every_directory_under_it() {
+        let d = nested();
+        let mut t = built_local(d.path(), false, 10);
+        assert!(t.nodes().iter().any(|n| n.name == "deep.rs"));
+
+        t.toggle(d.path());
+        rewalk(&mut t, d.path());
+        assert_eq!(t.nodes().len(), 1, "only the root should remain");
+
+        for dir in ["a", "a/b", "a/b/c", "x", "x/y", "z"] {
+            assert!(
+                t.is_collapsed(&d.path().join(dir)),
+                "{dir} should have been folded with the root"
+            );
+        }
+
+        // Reopening shows the top level, with its children still folded.
+        t.toggle(d.path());
+        rewalk(&mut t, d.path());
+        let names: Vec<&str> = t.nodes().iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"a") && names.contains(&"x") && names.contains(&"z"));
+        assert!(
+            !names.contains(&"deep.rs"),
+            "reopening the root must not re-expand the whole tree"
+        );
+    }
+
+    #[test]
+    fn collapsing_a_subtree_leaves_siblings_alone() {
+        let d = nested();
+        let mut t = built_local(d.path(), false, 10);
+        t.toggle(&d.path().join("a"));
+        rewalk(&mut t, d.path());
+        assert!(!t.is_collapsed(&d.path().join("x")), "a sibling was folded");
+        assert!(
+            t.nodes().iter().any(|n| n.name == "mid.rs"),
+            "sibling content vanished"
+        );
+        assert!(!t.nodes().iter().any(|n| n.name == "deep.rs"));
     }
 }

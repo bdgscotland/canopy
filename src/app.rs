@@ -376,7 +376,36 @@ impl App {
     }
 }
 
-pub(crate) fn copy_to_clipboard(text: &str) -> bool {
+/// Queue a clipboard write on a dedicated worker thread.
+///
+/// `pbcopy` is a spawn plus a write plus a `wait()` with no timeout, measured at
+/// 6.6 ms -- and it ran on the event-loop thread, on the path of every mouse
+/// release AND once per OSC 52 inside a single tick(), so a burst serialised
+/// into the UI. A clipboard is last-write-wins, so one long-lived worker with a
+/// queue preserves ordering; thread-per-request would not, and would let an
+/// unbounded number of threads pile up behind a wedged pbcopy.
+pub(crate) fn copy_to_clipboard(text: &str) {
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::OnceLock;
+    static TX: OnceLock<Sender<String>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = channel::<String>();
+        std::thread::spawn(move || {
+            while let Ok(mut text) = rx.recv() {
+                // Coalesce: only the newest write can win anyway, so drain the
+                // backlog rather than spawning pbcopy once per queued item.
+                while let Ok(newer) = rx.try_recv() {
+                    text = newer;
+                }
+                let _ = clipboard_write(&text);
+            }
+        });
+        tx
+    });
+    let _ = tx.send(text.to_string());
+}
+
+fn clipboard_write(text: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
         try_clipboard_cmd("pbcopy", &[], text)

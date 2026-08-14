@@ -48,6 +48,31 @@ impl EventHandler {
             let mut crossterm_events = EventStream::new();
             let mut pty_rx = pty_rx;
             let mut tick_interval = tokio::time::interval(tick_rate);
+
+            // Build the signal streams ONCE, before the loop.
+            //
+            // They used to be constructed inside the select! arm, so a fresh
+            // watch::Receiver was created and dropped on every iteration.
+            // signal_hook's Registry::broadcast flips `pending` to false before
+            // sending, and a send with zero receivers fails -- so a signal
+            // landing between iterations was lost permanently.
+            //
+            // Also register SIGINT and SIGHUP, not just SIGTERM. Previously
+            // both went unhandled: SIGINT and SIGHUP restored nothing, leaving
+            // the terminal in raw mode with the alt screen still active.
+            //
+            // .ok() rather than .expect(): a failed registration used to panic
+            // the spawned task, after which the whole UI hung forever waiting
+            // on a channel nobody was feeding. Degrade instead.
+            #[cfg(unix)]
+            let (mut sig_term, mut sig_int, mut sig_hup) = {
+                use tokio::signal::unix::{signal, SignalKind};
+                (
+                    signal(SignalKind::terminate()).ok(),
+                    signal(SignalKind::interrupt()).ok(),
+                    signal(SignalKind::hangup()).ok(),
+                )
+            };
             // Once the PTY channel closes, recv() returns None immediately and
             // forever. Without disabling the arm, select! completes instantly
             // in a tight loop: measured at 41.9M iterations in 5s. With a
@@ -119,12 +144,21 @@ impl EventHandler {
                             break;
                         }
                     }
-                    // SIGTERM handler (Unix only)
+                    // Termination signals. recv() is documented cancel-safe,
+                    // so losing the select! race does not drop a signal.
                     _ = async {
                         #[cfg(unix)]
                         {
-                            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("failed to register SIGTERM handler");
-                            sig.recv().await;
+                            match (sig_term.as_mut(), sig_int.as_mut(), sig_hup.as_mut()) {
+                                (None, None, None) => std::future::pending::<()>().await,
+                                (t, i, h) => {
+                                    tokio::select! {
+                                        _ = async { match t { Some(s) => { s.recv().await; }, None => std::future::pending().await } } => {},
+                                        _ = async { match i { Some(s) => { s.recv().await; }, None => std::future::pending().await } } => {},
+                                        _ = async { match h { Some(s) => { s.recv().await; }, None => std::future::pending().await } } => {},
+                                    }
+                                }
+                            }
                         }
                         #[cfg(not(unix))]
                         {

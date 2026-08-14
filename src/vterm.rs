@@ -1,6 +1,7 @@
 use ratatui::prelude::*;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use vte::{Params, Perform};
 
 #[derive(Clone, Debug)]
@@ -47,6 +48,19 @@ pub struct VirtualTerminal {
     // Alternate screen buffer (used by full-screen apps like vim, less, etc.)
     saved_grid: Option<Vec<Vec<Cell>>>,
     saved_scrollback: Option<VecDeque<Vec<Cell>>>,
+    /// Set by every Perform callback. A slice that produces none means vte is
+    /// accumulating bytes internally with no way for us to see them -- which is
+    /// exactly what a never-terminated OSC looks like.
+    saw_callback: bool,
+    /// Bytes accumulated inside the OSC currently being parsed. vte's own
+    /// `MAX_OSC_RAW` guard is `#[cfg(not(feature = "std"))]` and compiled out
+    /// of this build, so its buffer grows without limit -- measured 1:1 with
+    /// input, 64 MiB in gave 70 MB RSS, and `Vec::clear()` keeps the capacity.
+    osc_bytes: usize,
+    /// How many times an escape flood or oversized escape was discarded.
+    escape_floods: u32,
+    /// One-shot message for the UI.
+    truncation_notice: Option<String>,
     /// Lines that have fallen out of the front of `scrollback`, ever.
     ///
     /// Selections anchor to ABSOLUTE line numbers rather than screen rows.
@@ -72,6 +86,12 @@ pub struct VirtualTerminal {
 
 const MAX_SCROLLBACK: usize = 1000;
 
+/// Cap on a single OSC payload. Deliberately generous: Claude emits clipboard
+/// writes through OSC 52 with no length limit of its own, and truncating a real
+/// clipboard payload would be a silent data bug. This exists to catch an OSC
+/// that never terminates, not to limit legitimate ones.
+const MAX_OSC_BYTES: usize = 8 * 1024 * 1024;
+
 impl VirtualTerminal {
     pub fn new(cols: usize, rows: usize) -> Self {
         Self {
@@ -85,6 +105,10 @@ impl VirtualTerminal {
             saved_cursor: None,
             saved_grid: None,
             saved_scrollback: None,
+            saw_callback: false,
+            osc_bytes: 0,
+            escape_floods: 0,
+            truncation_notice: None,
             lines_evicted: 0,
             saved_main_cursor: None,
             parser: Some(vte::Parser::new()),
@@ -131,11 +155,84 @@ impl VirtualTerminal {
     }
 
     /// Feed raw PTY bytes through the vte parser
+    /// Feed bytes from the child, with a wall-clock budget.
+    ///
+    /// This runs on the PTY reader thread while HOLDING the vterm mutex, which
+    /// the main thread needs to render or handle a mouse event. Clamping the
+    /// individual operations is necessary but not sufficient: the already-
+    /// clamped IL/DL/SU/SD still cost 38-41 ms per 4 KiB chunk under an escape
+    /// flood, and a 1 MiB file of them rendered 20 frames in 62 seconds with a
+    /// peak lock wait of 16.8 s. A user does not wait that out; they SIGKILL,
+    /// and the session goes with it.
+    ///
+    /// So the budget is the class-level backstop: process in slices, and once
+    /// over budget, discard the rest of the buffer and say so. Losing some
+    /// output is strictly better than losing the session.
     pub fn feed(&mut self, bytes: &[u8]) {
-        // Take the parser out temporarily to avoid double borrow
+        const BUDGET: Duration = Duration::from_millis(20);
+        const SLICE: usize = 512;
+
+        let start = Instant::now();
         let mut parser = self.parser.take().unwrap_or_default();
-        parser.advance(self, bytes);
+
+        let mut consumed = 0;
+        while consumed < bytes.len() {
+            let end = (consumed + SLICE).min(bytes.len());
+            let slice_len = end - consumed;
+            self.saw_callback = false;
+            parser.advance(self, &bytes[consumed..end]);
+            consumed = end;
+
+            // No callback at all means every byte in that slice disappeared
+            // into vte's internal accumulator. vte's own MAX_OSC_RAW guard is
+            // cfg(not(std)) and compiled out of this build, so it has no
+            // ceiling: measured 1:1 growth, 64 MiB in gave 70 MB RSS. Worse
+            // than the memory, the pane silently stops updating and never
+            // recovers, which is indistinguishable from a hang.
+            if self.saw_callback {
+                self.osc_bytes = 0;
+            } else {
+                self.osc_bytes += slice_len;
+            }
+
+            if consumed < bytes.len() && start.elapsed() > BUDGET {
+                self.escape_floods += 1;
+                self.parser = Some(vte::Parser::new());
+                self.note_truncation(bytes.len() - consumed);
+                return;
+            }
+
+            // An OSC with no terminator swallows every following byte, so the
+            // pane silently stops updating and never recovers. Replacing the
+            // parser frees the buffer AND returns to Ground, so the remaining
+            // bytes render as text instead of vanishing.
+            if self.osc_bytes > MAX_OSC_BYTES {
+                self.osc_bytes = 0;
+                self.escape_floods += 1;
+                parser = vte::Parser::new();
+                self.note_truncation(0);
+            }
+        }
+
         self.parser = Some(parser);
+    }
+
+    /// Tell the user we dropped output rather than doing it silently.
+    fn note_truncation(&mut self, dropped: usize) {
+        self.truncation_notice = Some(if dropped > 0 {
+            format!("output truncated: escape flood, {dropped} bytes dropped")
+        } else {
+            "oversized escape sequence discarded".to_string()
+        });
+    }
+
+    /// A one-shot notice for the UI, cleared when read.
+    pub fn take_truncation_notice(&mut self) -> Option<String> {
+        self.truncation_notice.take()
+    }
+
+    pub fn escape_floods(&self) -> u32 {
+        self.escape_floods
     }
 
     /// Clamp a cursor to the current grid. Saved cursors outlive the geometry
@@ -696,6 +793,13 @@ impl VirtualTerminal {
         if self.cursor.y >= self.rows {
             return;
         }
+        // A CSI parameter is a u16, so this loops up to 65535 times without a
+        // clamp -- each iteration an O(cols) Vec::remove plus a String free and
+        // alloc. Measured: ESC[65535P took 1.9-2.2 s while HOLDING the vterm
+        // mutex, against 0.07 ms for plain text. Operating past the end of the
+        // line is a no-op in xterm, so clamping is behaviour-preserving.
+        // insert_lines and delete_lines already clamped; these three did not.
+        let count = count.min(self.cols);
         let row = &mut self.grid[self.cursor.y];
         for _ in 0..count {
             if self.cursor.x < row.len() {
@@ -706,6 +810,7 @@ impl VirtualTerminal {
     }
 
     fn insert_chars(&mut self, count: usize) {
+        let count = count.min(self.cols);
         if self.cursor.y >= self.rows {
             return;
         }
@@ -719,6 +824,7 @@ impl VirtualTerminal {
     }
 
     fn erase_chars(&mut self, count: usize) {
+        let count = count.min(self.cols);
         if self.cursor.y >= self.rows {
             return;
         }
@@ -731,16 +837,26 @@ impl VirtualTerminal {
     }
 
     fn enter_alternate_screen(&mut self) {
-        self.saved_grid = Some(self.grid.clone());
-        self.saved_scrollback = Some(self.scrollback.clone());
-        self.saved_main_cursor = Some(self.cursor.clone());
-        // Both the scrollback AND the grid are replaced, so every line number
-        // currently addressable must be retired. Bumping past only the
-        // scrollback would let alt-screen content reuse numbers a live
-        // selection still holds, and the highlight would land on new text.
+        // Entering must be idempotent: a second ESC[?1049h used to overwrite
+        // the saved buffers with the ALT screen's, permanently destroying the
+        // main screen the user came from.
+        if self.saved_grid.is_some() {
+            return;
+        }
+        // mem::take, not clone. The old code cloned the grid and the entire
+        // scrollback and then immediately overwrote/cleared both -- measured at
+        // 1.68 ms and 109,084 allocations with a full scrollback, for a copy
+        // that was thrown away on the next line.
+        // Retire the line numbers BEFORE taking the buffers, or the counts are
+        // already zero. Both the scrollback and the grid are replaced, so every
+        // currently addressable number must be retired: otherwise alt-screen
+        // content reuses numbers a live selection still holds and the highlight
+        // lands on unrelated text.
         self.lines_evicted += (self.scrollback.len() + self.grid.len()) as u64;
+        self.saved_grid = Some(std::mem::take(&mut self.grid));
+        self.saved_scrollback = Some(std::mem::take(&mut self.scrollback));
+        self.saved_main_cursor = Some(std::mem::take(&mut self.cursor));
         self.grid = Self::make_grid(self.cols, self.rows);
-        self.scrollback.clear();
         self.cursor = CursorState::default();
     }
 
@@ -824,10 +940,12 @@ fn base64_decode(input: &str) -> Option<String> {
 
 impl Perform for VirtualTerminal {
     fn print(&mut self, c: char) {
+        self.saw_callback = true;
         self.put_char(c);
     }
 
     fn execute(&mut self, byte: u8) {
+        self.saw_callback = true;
         match byte {
             // BEL
             7 => {}
@@ -858,18 +976,25 @@ impl Perform for VirtualTerminal {
     }
 
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {
+        self.saw_callback = true;
         // DCS sequences - not needed for basic terminal emulation
     }
 
     fn put(&mut self, _byte: u8) {
+        self.saw_callback = true;
         // DCS data bytes
     }
 
     fn unhook(&mut self) {
+        self.saw_callback = true;
         // End of DCS sequence
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        self.saw_callback = true;
+        // A completed OSC resets the accumulator; the counter only matters for
+        // one that never terminates.
+        self.osc_bytes = 0;
         if let Some(first) = params.first() {
             // OSC 7: Current working directory reporting
             // Format: OSC 7 ; file://hostname/path ST
@@ -903,6 +1028,7 @@ impl Perform for VirtualTerminal {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        self.saw_callback = true;
         // A CSI sequence carrying an intermediate or a private marker
         // ('?', '<', '=', '>', '!', '$', ' ', '#') shares its final byte with a
         // standard sequence but means something entirely different. vte routes
@@ -1158,6 +1284,7 @@ impl Perform for VirtualTerminal {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        self.saw_callback = true;
         // Same class as csi_dispatch. ESC # 8 (DECALN) and ESC ( B (charset
         // selection) carry intermediates and share their final byte with
         // ESC 8 (DECRC) and ESC B. Discarding the intermediate meant DECALN
@@ -1747,6 +1874,70 @@ mod tests {
             vt.scrollback().is_empty(),
             "the alt screen must not accrue scrollback"
         );
+    }
+
+    #[test]
+    fn an_escape_flood_cannot_hold_the_lock_for_seconds() {
+        // ICH/DCH took a raw u16 CSI parameter and looped up to 65535 times,
+        // each an O(cols) Vec::remove plus a String free/alloc -- measured at
+        // 1.9-2.2 s per sequence WHILE HOLDING the vterm mutex the main thread
+        // needs to render. A 1 MiB file of them rendered 20 frames in 62 s.
+        let mut vt = VirtualTerminal::new(140, 48);
+        let flood: Vec<u8> = b"\x1b[65535@\x1b[65535P\x1b[65535X".repeat(400).to_vec();
+        let start = Instant::now();
+        vt.feed(&flood);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "an escape flood held the lock for {elapsed:?}"
+        );
+        assert_grid_shape(&vt, "after an escape flood");
+    }
+
+    #[test]
+    fn clamping_is_behaviour_preserving_for_real_counts() {
+        // xterm treats operating past the end of the line as a no-op, so the
+        // clamp must not change any legitimate result.
+        let mut vt = VirtualTerminal::new(10, 3);
+        vt.feed(b"ABCDEFGHIJ\x1b[1;1H\x1b[3P");
+        let row: String = vt.grid()[0].iter().map(|c| c.ch.as_str()).collect();
+        assert_eq!(row.trim_end(), "DEFGHIJ", "DCH 3 should delete three cells");
+
+        let mut vt = VirtualTerminal::new(10, 3);
+        vt.feed(b"ABCDEFGHIJ\x1b[1;1H\x1b[99P");
+        let row: String = vt.grid()[0].iter().map(|c| c.ch.as_str()).collect();
+        assert_eq!(row.trim_end(), "", "DCH past the line clears it");
+    }
+
+    #[test]
+    fn an_unterminated_osc_does_not_swallow_the_session() {
+        // vte's MAX_OSC_RAW guard is cfg(not(std)) and compiled out here, so
+        // its buffer has no ceiling. The realistic failure is not OOM: while
+        // the parser sits in OscString every byte vanishes, so the pane stops
+        // updating forever while the app keeps drawing -- a hang, to the user.
+        let mut vt = VirtualTerminal::new(80, 24);
+        vt.feed(b"\x1b]52;c;");
+        let junk = vec![b'A'; 1024 * 1024];
+        for _ in 0..12 {
+            vt.feed(&junk);
+        }
+        // The parser must have been reset, so ordinary text renders again.
+        vt.feed(b"\x1b[2J\x1b[1;1HRECOVERED");
+        let row: String = vt.grid()[0].iter().map(|c| c.ch.as_str()).collect();
+        assert!(
+            row.starts_with("RECOVERED"),
+            "the pane never recovered from an unterminated OSC: {row:?}"
+        );
+        assert!(vt.escape_floods() > 0, "the discard should be counted");
+    }
+
+    #[test]
+    fn a_legitimate_osc_still_works() {
+        // The cap must not break real clipboard writes.
+        let mut vt = VirtualTerminal::new(80, 24);
+        vt.feed(b"\x1b]52;c;SGVsbG8=\x1b\\");
+        assert_eq!(vt.take_clipboard_requests(), vec!["Hello".to_string()]);
+        assert_eq!(vt.escape_floods(), 0, "a valid OSC must not be discarded");
     }
 
     #[test]

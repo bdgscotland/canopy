@@ -277,7 +277,12 @@ impl App {
         if let Some(path) = self.pending_reveal.take() {
             if self.tree.reveal(&path, visible) {
                 self.reveal_attempts = 0;
-            } else if self.reveal_attempts < 10 {
+            } else if self.reveal_attempts < 3 {
+                // 3, not 10: drain_walks runs before poll_activity and the
+                // 250 ms throttle outlasts the 200 ms tick, so attempt 2 is
+                // routinely the one that succeeds for a genuinely new file.
+                // Ten attempts only ever burned walks on paths that could
+                // never appear.
                 self.reveal_attempts += 1;
                 self.request_refresh();
                 self.pending_reveal = Some(path);
@@ -290,6 +295,16 @@ impl App {
         };
 
         self.highlight = Some((latest.path.clone(), latest.kind));
+
+        // Open whatever is hiding it. Must happen BEFORE request_refresh, which
+        // clones the fold set for the off-thread walk -- otherwise the walk runs
+        // against the old set and the file stays hidden for another round.
+        if self.tree.reveal_ancestors(&latest.path) {
+            self.request_refresh();
+            self.pending_reveal = Some(latest.path.clone());
+            self.reveal_attempts = 0;
+            return;
+        }
 
         if !self.tree.reveal(&latest.path, visible) {
             // A rebuild is only worth it if the path COULD appear. Without this

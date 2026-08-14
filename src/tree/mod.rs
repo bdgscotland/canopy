@@ -32,6 +32,10 @@ pub struct FileTree {
     /// expanded so the default (everything open to max_depth) needs no state
     /// and survives a rebuild without having to be reconstructed.
     collapsed: std::collections::HashSet<PathBuf>,
+    /// Directories un-folded automatically to show what Claude just touched,
+    /// remembered so they can be re-folded. A user's explicit click always
+    /// wins over these.
+    auto_expanded: Vec<PathBuf>,
 }
 
 impl FileTree {
@@ -44,6 +48,7 @@ impl FileTree {
             offset: 0,
             ignores: build_ignores(root),
             collapsed: std::collections::HashSet::new(),
+            auto_expanded: Vec::new(),
         };
 
         // Deliberately NOT walked here.
@@ -81,6 +86,59 @@ impl FileTree {
         self.offset = offset;
     }
 
+    /// Un-fold whatever is hiding `path`, so following Claude survives a fold.
+    ///
+    /// Without this the premise fails silently: fold `src/` and every file
+    /// Claude touches beneath it is unreachable -- `index_of` returns None,
+    /// `reveal` returns false, and `poll_activity` burns its whole retry budget
+    /// on walks that cannot possibly help. Folding the repo name, one
+    /// documented click, reduced the tree to a single node and killed following
+    /// for the rest of the session.
+    ///
+    /// Anything auto-expanded for a PREVIOUS reveal and not needed for this one
+    /// is re-folded here, so the restore rides along on the same walk and needs
+    /// no separate "activity left the subtree" test.
+    ///
+    /// Returns true when the fold set changed and a walk is needed.
+    pub fn reveal_ancestors(&mut self, path: &Path) -> bool {
+        let mut changed = false;
+
+        // Re-fold anything we opened for an earlier reveal that this one does
+        // not need. An explicit click removes entries from auto_expanded, so
+        // this can never undo a deliberate expansion.
+        let still_needed: Vec<PathBuf> = self
+            .auto_expanded
+            .iter()
+            .filter(|d| path.starts_with(d))
+            .cloned()
+            .collect();
+        for dir in std::mem::replace(&mut self.auto_expanded, still_needed) {
+            if !path.starts_with(&dir) {
+                changed |= self.collapsed.insert(dir);
+            }
+        }
+
+        // Open every folded ancestor of the target.
+        let mut ancestor = path.parent();
+        while let Some(dir) = ancestor {
+            if self.collapsed.remove(dir) {
+                self.auto_expanded.push(dir.to_path_buf());
+                changed = true;
+            }
+            if dir == self.root {
+                break;
+            }
+            ancestor = dir.parent();
+        }
+        changed
+    }
+
+    #[cfg(test)]
+    pub fn expand_all_for_test(&mut self) {
+        self.collapsed.clear();
+        self.auto_expanded.clear();
+    }
+
     /// Toggle a directory open or closed. Returns true when the fold state
     /// changed, so the caller knows to schedule a walk.
     ///
@@ -96,6 +154,8 @@ impl FileTree {
             return false;
         }
         let path = path.to_path_buf();
+        // A deliberate click takes this directory out of automatic control.
+        self.auto_expanded.retain(|d| *d != path);
         let is_root = path == self.root;
         if self.collapsed.contains(&path) {
             // Reopening unfolds only this directory. Reopening the root shows
@@ -179,6 +239,9 @@ impl FileTree {
             .filter(|n| n.is_dir && n.path.starts_with(path))
             .map(|n| n.path.clone())
             .collect();
+        // Folding a subtree also drops any automatic expansions inside it, or
+        // the next reveal would resurrect them.
+        self.auto_expanded.retain(|d| !d.starts_with(path));
         self.collapsed.extend(descendants);
     }
 
@@ -375,6 +438,10 @@ impl FileTree {
         {
             return true;
         }
+        // NOTE: a folded ancestor is deliberately NOT "can never show". Folds
+        // are transient and reveal_ancestors opens them, so treating a folded
+        // path as unshowable would be the same silent failure from the other
+        // direction.
         self.is_noise(path)
     }
 
@@ -848,6 +915,98 @@ mod recursive_collapse_tests {
 
     /// Folding the root folds everything beneath it, so reopening shows the top
     /// level rather than the fully-expanded tree you just closed.
+    /// Following Claude must survive a fold. This is the premise of the whole
+    /// tool, and adding click-to-collapse silently broke it: folding `src/`
+    /// made every file beneath it unreachable -- index_of None, reveal false --
+    /// while can_never_show said false, so poll_activity burned its entire
+    /// retry budget on walks that could not possibly help. Folding the repo
+    /// name, one documented click, reduced the tree to a single node and killed
+    /// following for the rest of the session.
+    #[test]
+    fn following_survives_a_fold() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("src/tree")).unwrap();
+        std::fs::write(d.path().join("src/tree/mod.rs"), "x").unwrap();
+        std::fs::write(d.path().join("README.md"), "x").unwrap();
+        let mut t = built_local(d.path(), false, 10);
+        let target = d.path().join("src/tree/mod.rs");
+
+        for fold in [d.path().join("src"), d.path().to_path_buf()] {
+            t.toggle(&fold);
+            rewalk(&mut t, d.path());
+            assert!(t.index_of(&target).is_none(), "precondition: it is hidden");
+
+            // What the app does when Claude touches a hidden file.
+            assert!(t.reveal_ancestors(&target), "should need a walk");
+            rewalk(&mut t, d.path());
+            assert!(
+                t.reveal(&target, 20),
+                "Claude touched a file and the tree could not show it (folded {})",
+                fold.display()
+            );
+
+            // Put it back for the next case.
+            t.expand_all_for_test();
+            rewalk(&mut t, d.path());
+        }
+    }
+
+    /// An automatic expansion must not leak: once activity moves elsewhere, the
+    /// directory folds again, so the tree does not slowly unfold itself.
+    #[test]
+    fn auto_expansion_is_undone_when_activity_moves_on() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("a/deep")).unwrap();
+        std::fs::create_dir_all(d.path().join("b")).unwrap();
+        std::fs::write(d.path().join("a/deep/one.rs"), "x").unwrap();
+        std::fs::write(d.path().join("b/two.rs"), "x").unwrap();
+        let mut t = built_local(d.path(), false, 10);
+
+        t.toggle(&d.path().join("a"));
+        rewalk(&mut t, d.path());
+        assert!(t.is_collapsed(&d.path().join("a")));
+
+        t.reveal_ancestors(&d.path().join("a/deep/one.rs"));
+        rewalk(&mut t, d.path());
+        assert!(
+            !t.is_collapsed(&d.path().join("a")),
+            "opened to show the file"
+        );
+
+        // Activity moves to an unrelated subtree.
+        t.reveal_ancestors(&d.path().join("b/two.rs"));
+        rewalk(&mut t, d.path());
+        assert!(
+            t.is_collapsed(&d.path().join("a")),
+            "an automatic expansion leaked; the tree would unfold itself over time"
+        );
+    }
+
+    /// A deliberate click outranks the automatic machinery, always.
+    #[test]
+    fn an_explicit_click_beats_an_automatic_expansion() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("a/deep")).unwrap();
+        std::fs::create_dir_all(d.path().join("b")).unwrap();
+        std::fs::write(d.path().join("a/deep/one.rs"), "x").unwrap();
+        std::fs::write(d.path().join("b/two.rs"), "x").unwrap();
+        let mut t = built_local(d.path(), false, 10);
+
+        t.toggle(&d.path().join("a"));
+        t.reveal_ancestors(&d.path().join("a/deep/one.rs"));
+        // The user now opens it deliberately.
+        t.toggle(&d.path().join("a"));
+        assert!(t.is_collapsed(&d.path().join("a")), "click folds it");
+
+        // Activity elsewhere must not resurrect the automatic expansion.
+        t.reveal_ancestors(&d.path().join("b/two.rs"));
+        rewalk(&mut t, d.path());
+        assert!(
+            t.is_collapsed(&d.path().join("a")),
+            "the automatic machinery overrode a deliberate click"
+        );
+    }
+
     #[test]
     fn collapsing_the_root_collapses_every_directory_under_it() {
         let d = nested();

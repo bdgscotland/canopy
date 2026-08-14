@@ -115,42 +115,46 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
                 let display = if is_cwd {
                     format!("{}● {}", icon, node.name)
                 } else {
-                    format!("{} {}", icon, node.name)
+                    format!("{}{}", icon, node.name)
                 };
-                buf.set_string(x_offset, y, &display, node_style);
+                let room = (area.x + area.width).saturating_sub(x_offset + 1) as usize;
+                buf.set_stringn(x_offset, y, &display, room, node_style);
                 x_offset += unicode_width::UnicodeWidthStr::width(display.as_str()) as u16;
             } else {
                 // Draw ancestor connectors
                 for &ancestor_is_last in &node.connector {
-                    let connector_str = if ancestor_is_last { "    " } else { "│   " };
+                    let connector_str = if ancestor_is_last { "  " } else { "│ " };
                     buf.set_string(x_offset, y, connector_str, tree_style);
-                    x_offset += 4;
+                    x_offset += 2;
                 }
 
                 // Draw this node's branch connector
-                let branch = if node.is_last {
-                    "└── "
-                } else {
-                    "├── "
-                };
+                let branch = if node.is_last { "└─" } else { "├─" };
                 buf.set_string(x_offset, y, branch, tree_style);
-                x_offset += 4;
+                x_offset += 2;
 
                 // Draw icon + name
                 let icon = node.expanded_icon(!self.tree.is_collapsed(&node.path));
                 let display = if is_cwd {
                     format!("{}● {}", icon, node.name)
                 } else {
-                    format!("{} {}", icon, node.name)
+                    format!("{}{}", icon, node.name)
                 };
-                buf.set_string(x_offset, y, &display, node_style);
+                // set_string clips at the BUFFER's right edge, not this
+                // widget's, so an overlong name used to paint over the tree's
+                // own border. Reserve the last column for the scrollbar too.
+                let room = (area.x + area.width).saturating_sub(x_offset + 1) as usize;
+                buf.set_stringn(x_offset, y, &display, room, node_style);
                 x_offset += unicode_width::UnicodeWidthStr::width(display.as_str()) as u16;
             }
 
-            // Truncate if too long
+            // Mark truncation one column in from the edge: the last column
+            // belongs to the scrollbar, which is painted afterwards, so a
+            // marker written there was invisible exactly when the tree was long
+            // enough to need one.
             let total_width = x_offset.saturating_sub(area.x);
-            if total_width > area.width {
-                if let Some(x) = area.x.checked_add(area.width.saturating_sub(1)) {
+            if total_width > area.width.saturating_sub(1) {
+                if let Some(x) = area.x.checked_add(area.width.saturating_sub(2)) {
                     if let Some(cell) = buf.cell_mut((x, y)) {
                         cell.set_symbol("…");
                     }
@@ -199,5 +203,73 @@ mod tests {
         let mut state = FileTreeWidgetState { offset: 0 };
 
         widget.render(area, &mut buf, &mut state);
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+    use crate::tree::FileTree;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    fn render_at(width: u16) -> Buffer {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("src/tree")).unwrap();
+        std::fs::write(d.path().join("src/tree/file_node.rs"), "x").unwrap();
+        let mut tree = FileTree::new(d.path(), false, 10).unwrap();
+        tree.set_nodes(crate::tree::walk(d.path(), false, 10, tree.collapsed_set()));
+
+        let area = Rect::new(0, 0, width, 10);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width + 4, 10));
+        let mut state = FileTreeWidgetState { offset: 0 };
+        FileTreeWidget::new(&tree, None).render(area, &mut buf, &mut state);
+        buf
+    }
+
+    /// Chrome per level was four columns, so a depth-3 file spent 15 columns
+    /// before its name started -- inside the 22-column pane a default
+    /// `--tree-width 30` gives on an 80-column terminal. Two columns per level
+    /// matches nvim-tree's default and this repo's own README diagram.
+    #[test]
+    fn indentation_leaves_room_for_the_filename() {
+        let buf = render_at(24);
+        let deep = (0..10)
+            .map(|y| {
+                (0..24)
+                    .map(|x| buf.cell((x, y)).map_or(" ", |c| c.symbol()))
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("file_node"))
+            .expect("the deep file should render");
+
+        // Count COLUMNS, not bytes: the connectors are multi-byte, so
+        // str::find would report 14 for a name starting in column 9.
+        let name_starts = deep
+            .char_indices()
+            .position(|(i, _)| deep[i..].starts_with("file_node"))
+            .expect("name present");
+        assert!(
+            name_starts <= 8,
+            "chrome ate {name_starts} columns before the name: {deep:?}"
+        );
+        assert!(
+            deep.contains("file_node.rs"),
+            "the name was truncated in a 24-column pane: {deep:?}"
+        );
+    }
+
+    /// set_string clips at the BUFFER edge, not the widget's, so a long name
+    /// used to paint over the tree's own border column.
+    #[test]
+    fn a_long_name_never_paints_past_the_pane() {
+        let width = 14u16;
+        let buf = render_at(width);
+        for y in 0..10 {
+            for x in width..width + 4 {
+                let sym = buf.cell((x, y)).map_or(" ", |c| c.symbol());
+                assert_eq!(sym, " ", "painted outside the pane at ({x},{y}): {sym:?}");
+            }
+        }
     }
 }

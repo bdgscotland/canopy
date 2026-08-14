@@ -248,6 +248,16 @@ impl VirtualTerminal {
         }
     }
 
+    /// True while the child is on the alternate screen.
+    ///
+    /// Alt screen has no scrollback by design — that is the point of it — so a
+    /// wheel event must be translated into arrow keys for the application to
+    /// handle, exactly as xterm, Ghostty and iTerm2 do. Claude Code lives on
+    /// the alt screen and manages its own conversation history.
+    pub fn in_alternate_screen(&self) -> bool {
+        self.saved_grid.is_some()
+    }
+
     pub fn scrollback(&self) -> &VecDeque<Vec<Cell>> {
         &self.scrollback
     }
@@ -293,8 +303,11 @@ impl VirtualTerminal {
             return;
         }
         let removed = self.grid.remove(self.scroll_top);
-        // Only push to scrollback if scrolling from the very top of the screen
-        if self.scroll_top == 0 {
+        // Scrollback accrues only from the MAIN screen, and only when scrolling
+        // from the very top. Lines leaving the alternate screen are discarded,
+        // as in every real terminal: alt screen has no history, which is why a
+        // pager or editor never pollutes what you scroll back to.
+        if self.scroll_top == 0 && self.saved_grid.is_none() {
             self.scrollback.push_back(removed);
             if self.scrollback.len() > MAX_SCROLLBACK {
                 self.scrollback.pop_front();
@@ -1675,6 +1688,65 @@ mod tests {
         // And it still works.
         vt.feed(b"hello");
         assert_eq!(vt.grid()[0][0].ch, "h");
+    }
+
+    #[test]
+    fn alt_screen_is_detectable_so_the_wheel_can_be_translated() {
+        // Claude Code lives on the alt screen, verified from a real capture:
+        // ESC[?1049h appears and is never followed by ESC[?1049l. Alt screen
+        // has no scrollback by design, so a wheel event must become arrow keys
+        // for the app to handle -- which is what every real terminal does.
+        let mut vt = VirtualTerminal::new(80, 24);
+        assert!(!vt.in_alternate_screen());
+        vt.feed(b"\x1b[?1049h");
+        assert!(vt.in_alternate_screen(), "alt screen must be observable");
+        vt.feed(b"\x1b[?1049l");
+        assert!(!vt.in_alternate_screen());
+    }
+
+    #[test]
+    fn alt_screen_has_no_scrollback_to_scroll() {
+        // The reason the wheel appeared broken: we were moving an offset over a
+        // buffer that is always empty while the child is on the alt screen.
+        let mut vt = VirtualTerminal::new(40, 5);
+        for i in 0..40 {
+            vt.feed(format!("main{i}\r\n").as_bytes());
+        }
+        assert!(
+            !vt.scrollback().is_empty(),
+            "main screen accrues scrollback"
+        );
+
+        vt.feed(b"\x1b[?1049h");
+        assert!(vt.scrollback().is_empty(), "alt screen starts clean");
+        for i in 0..40 {
+            vt.feed(format!("alt{i}\r\n").as_bytes());
+        }
+        vt.set_scroll_offset(10);
+        assert_eq!(
+            vt.scroll_offset(),
+            0,
+            "there is nothing to scroll back to on the alt screen"
+        );
+    }
+
+    #[test]
+    fn real_claude_output_enters_the_alternate_screen() {
+        // Captured from a live session through a PTY. This is the evidence for
+        // translating the wheel into arrow keys: Claude is an alt-screen
+        // application, so there is no scrollback for the wheel to move through,
+        // exactly as in vim or less.
+        let raw = include_bytes!("../tests/fixtures/claude-altscreen.raw");
+        let mut vt = VirtualTerminal::new(100, 24);
+        vt.feed(raw);
+        assert!(
+            vt.in_alternate_screen(),
+            "Claude Code was expected to be on the alternate screen"
+        );
+        assert!(
+            vt.scrollback().is_empty(),
+            "the alt screen must not accrue scrollback"
+        );
     }
 
     #[test]

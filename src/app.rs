@@ -173,6 +173,9 @@ impl App {
         let root = self.tree.root_path().to_path_buf();
         let show_hidden = self.tree.show_hidden();
         let max_depth = self.tree.max_depth();
+        // Carry the fold state across, or every rescan silently re-opens
+        // everything the user closed.
+        let collapsed = self.tree.collapsed_set().clone();
         let tx = self.walk_tx.clone();
 
         self.walk_in_flight = true;
@@ -184,7 +187,7 @@ impl App {
         // current_thread runtime a blocking call in ANY task stalls every other
         // task, including the one reading the keyboard.
         tokio::task::spawn_blocking(move || {
-            let nodes = crate::tree::walk(&root, show_hidden, max_depth);
+            let nodes = crate::tree::walk(&root, show_hidden, max_depth, &collapsed);
             let _ = tx.send(WalkResult { root, nodes });
         });
     }
@@ -278,7 +281,7 @@ impl App {
                 if in_tree {
                     let offset = self.tree.offset();
                     self.tree.set_offset(offset.saturating_sub(3));
-                } else {
+                } else if !self.terminal.wheel(true, 3) {
                     self.terminal.scroll_up();
                 }
             }
@@ -288,7 +291,7 @@ impl App {
                     let max_offset = self.tree.nodes().len().saturating_sub(visible_height);
                     let offset = (self.tree.offset() + 3).min(max_offset);
                     self.tree.set_offset(offset);
-                } else {
+                } else if !self.terminal.wheel(false, 3) {
                     self.terminal.scroll_down();
                 }
             }
@@ -302,6 +305,18 @@ impl App {
                 } else {
                     None
                 };
+
+                // Click a directory in the tree to fold it. The mouse is the
+                // only input Canopy owns -- every keystroke is forwarded to
+                // Claude untouched -- so this costs the child nothing.
+                if in_tree {
+                    if let Some(area) = self.tree_area {
+                        let row = event.row.saturating_sub(area.y) as usize;
+                        if let Some(path) = self.tree.node_at_row(row).map(|n| n.path.clone()) {
+                            self.tree.toggle(&path);
+                        }
+                    }
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(anchor) = self.drag_anchor {

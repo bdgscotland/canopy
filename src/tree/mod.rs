@@ -28,6 +28,10 @@ pub struct FileTree {
     offset: usize,
     /// Used to discard filesystem events for paths the tree never shows.
     ignores: Gitignore,
+    /// Directories the user has collapsed. Stored as COLLAPSED rather than
+    /// expanded so the default (everything open to max_depth) needs no state
+    /// and survives a rebuild without having to be reconstructed.
+    collapsed: std::collections::HashSet<PathBuf>,
 }
 
 impl FileTree {
@@ -39,6 +43,7 @@ impl FileTree {
             max_depth,
             offset: 0,
             ignores: build_ignores(root),
+            collapsed: std::collections::HashSet::new(),
         };
 
         tree.rebuild_visible_nodes()?;
@@ -65,8 +70,43 @@ impl FileTree {
     /// The ONLY synchronous walk left, and it runs once at construction before
     /// the event loop exists. Every later walk goes through spawn_blocking.
     fn rebuild_visible_nodes(&mut self) -> Result<()> {
-        self.nodes = walk(&self.root, self.show_hidden, self.max_depth);
+        self.nodes = walk(
+            &self.root,
+            self.show_hidden,
+            self.max_depth,
+            &self.collapsed,
+        );
         Ok(())
+    }
+
+    /// Toggle a directory open or closed. Returns false for a file, so callers
+    /// can tell a no-op from a change worth redrawing for.
+    pub fn toggle(&mut self, path: &Path) -> bool {
+        let Some(node) = self.nodes.iter().find(|n| n.path == path) else {
+            return false;
+        };
+        if !node.is_dir {
+            return false;
+        }
+        let path = path.to_path_buf();
+        if !self.collapsed.remove(&path) {
+            self.collapsed.insert(path);
+        }
+        let _ = self.rebuild_visible_nodes();
+        true
+    }
+
+    pub fn is_collapsed(&self, path: &Path) -> bool {
+        self.collapsed.contains(path)
+    }
+
+    /// The node at a viewport row, accounting for the scroll offset.
+    pub fn node_at_row(&self, row: usize) -> Option<&FileNode> {
+        self.nodes.get(self.offset + row)
+    }
+
+    pub fn collapsed_set(&self) -> &std::collections::HashSet<PathBuf> {
+        &self.collapsed
     }
 
     /// Replace the node list with one produced off-thread by [`walk`].
@@ -91,7 +131,13 @@ impl FileTree {
 /// property of the filesystem, not of anything Canopy controls. It must be
 /// callable from `spawn_blocking`, off the event-loop thread. Running it inline
 /// froze the UI hard enough to need SIGKILL.
-pub fn walk(root: &Path, show_hidden: bool, max_depth: usize) -> Vec<FileNode> {
+/// Children of a collapsed directory are skipped.
+pub fn walk(
+    root: &Path,
+    show_hidden: bool,
+    max_depth: usize,
+    collapsed: &std::collections::HashSet<PathBuf>,
+) -> Vec<FileNode> {
     // ONE walker for the whole tree. The previous implementation created a
     // fresh WalkBuilder per directory with max_depth(1) and recursed -- 2,045
     // walkers and 186,649 is_dir() stats on a 20k-node repo, 443 ms. Every
@@ -148,19 +194,21 @@ pub fn walk(root: &Path, show_hidden: bool, max_depth: usize) -> Vec<FileNode> {
         vec![],
     ));
     if is_dir {
-        emit_children(&mut nodes, root, 1, &[], &children);
+        emit_children(&mut nodes, root, 1, &[], &children, collapsed);
     }
     nodes
 }
 
 /// Emit a directory's children depth-first, tracking the connector state each
 /// row needs to draw its ancestry.
+#[allow(clippy::too_many_arguments)]
 fn emit_children(
     nodes: &mut Vec<FileNode>,
     parent: &Path,
     depth: usize,
     connector: &[bool],
     children: &std::collections::HashMap<PathBuf, Vec<(PathBuf, String, bool)>>,
+    collapsed: &std::collections::HashSet<PathBuf>,
 ) {
     let Some(list) = children.get(parent) else {
         return;
@@ -176,10 +224,17 @@ fn emit_children(
             is_last,
             connector.to_vec(),
         ));
-        if *is_dir {
+        if *is_dir && !collapsed.contains(path) {
             let mut child_connector = connector.to_vec();
             child_connector.push(is_last);
-            emit_children(nodes, path, depth + 1, &child_connector, children);
+            emit_children(
+                nodes,
+                path,
+                depth + 1,
+                &child_connector,
+                children,
+                collapsed,
+            );
         }
     }
 }
@@ -472,5 +527,97 @@ mod visibility_tests {
     fn show_hidden_makes_dotfiles_showable_again() {
         let (d, t) = tree_with(true, 10);
         assert!(!t.can_never_show(&d.path().join(".github/workflows/ci.yml")));
+    }
+}
+
+#[cfg(test)]
+mod collapse_tests {
+    use super::*;
+
+    fn fixture() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("src/inner")).unwrap();
+        std::fs::create_dir_all(d.path().join("docs")).unwrap();
+        std::fs::write(d.path().join("src/main.rs"), "x").unwrap();
+        std::fs::write(d.path().join("src/inner/deep.rs"), "x").unwrap();
+        std::fs::write(d.path().join("docs/readme.md"), "x").unwrap();
+        d
+    }
+
+    /// The tree drew expand/collapse chevrons from the start but had no
+    /// expansion state at all and never received a keystroke, so the glyph
+    /// promised something that did not exist.
+    #[test]
+    fn collapsing_a_directory_hides_its_children() {
+        let d = fixture();
+        let mut t = FileTree::new(d.path(), false, 10).unwrap();
+        let before = t.nodes().len();
+        assert!(t.nodes().iter().any(|n| n.name == "main.rs"));
+
+        assert!(
+            t.toggle(&d.path().join("src")),
+            "toggling a dir must report a change"
+        );
+        assert!(t.is_collapsed(&d.path().join("src")));
+        assert!(
+            !t.nodes().iter().any(|n| n.name == "main.rs"),
+            "children still shown"
+        );
+        assert!(
+            !t.nodes().iter().any(|n| n.name == "deep.rs"),
+            "grandchildren still shown"
+        );
+        assert!(
+            t.nodes().iter().any(|n| n.name == "src"),
+            "the dir itself must remain"
+        );
+        assert!(
+            t.nodes().iter().any(|n| n.name == "readme.md"),
+            "siblings must be untouched"
+        );
+        assert!(t.nodes().len() < before);
+
+        assert!(t.toggle(&d.path().join("src")));
+        assert!(!t.is_collapsed(&d.path().join("src")));
+        assert_eq!(t.nodes().len(), before, "reopening must restore exactly");
+    }
+
+    #[test]
+    fn toggling_a_file_does_nothing() {
+        let d = fixture();
+        let mut t = FileTree::new(d.path(), false, 10).unwrap();
+        let before = t.nodes().len();
+        assert!(!t.toggle(&d.path().join("src/main.rs")));
+        assert_eq!(t.nodes().len(), before);
+    }
+
+    /// A rescan must not silently re-open everything the user closed. The
+    /// off-thread walk takes the collapsed set for exactly this reason.
+    #[test]
+    fn fold_state_survives_a_rescan() {
+        let d = fixture();
+        let mut t = FileTree::new(d.path(), false, 10).unwrap();
+        t.toggle(&d.path().join("src"));
+        let folded = t.nodes().len();
+
+        let nodes = walk(d.path(), false, 10, t.collapsed_set());
+        assert_eq!(
+            nodes.len(),
+            folded,
+            "an off-thread rescan re-opened the tree"
+        );
+        assert!(!nodes.iter().any(|n| n.name == "main.rs"));
+    }
+
+    #[test]
+    fn node_at_row_accounts_for_scrolling() {
+        let d = fixture();
+        let mut t = FileTree::new(d.path(), false, 10).unwrap();
+        let first = t.node_at_row(0).unwrap().path.clone();
+        assert_eq!(first, t.root_path());
+        t.set_offset(2);
+        let shifted = t.node_at_row(0).unwrap().path.clone();
+        assert_ne!(shifted, first, "clicking must follow the scroll offset");
+        assert_eq!(shifted, t.nodes()[2].path);
     }
 }

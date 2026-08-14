@@ -686,6 +686,27 @@ impl TerminalPane {
         lock_or_recover(&self.vterm)
     }
 
+    /// Wheel handling, matching what real terminals do.
+    ///
+    /// On the alt screen there is no scrollback to move through, so the wheel
+    /// becomes arrow keys and the application scrolls itself. Claude Code is an
+    /// alt-screen app, which is why scrolling appeared to do nothing at all:
+    /// we were moving a scroll offset over a buffer that is always empty.
+    ///
+    /// Returns true if the event was translated and sent to the child.
+    pub fn wheel(&mut self, up: bool, lines: usize) -> bool {
+        if !self.vterm_lock().in_alternate_screen() {
+            return false;
+        }
+        let seq: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
+        let mut buf = Vec::with_capacity(seq.len() * lines);
+        for _ in 0..lines {
+            buf.extend_from_slice(seq);
+        }
+        self.enqueue(buf);
+        true
+    }
+
     pub fn scroll_up(&mut self) {
         let mut vt = lock_or_recover(&self.vterm);
         let current = vt.scroll_offset();

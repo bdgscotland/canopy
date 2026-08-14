@@ -111,7 +111,7 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
 
             if node.depth == 0 {
                 // Root node: icon + name, no tree prefix
-                let icon = node.expanded_icon(true);
+                let icon = node.expanded_icon(!self.tree.is_collapsed(&node.path));
                 let display = if is_cwd {
                     format!("{}● {}", icon, node.name)
                 } else {
@@ -137,7 +137,7 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
                 x_offset += 4;
 
                 // Draw icon + name
-                let icon = node.expanded_icon(true);
+                let icon = node.expanded_icon(!self.tree.is_collapsed(&node.path));
                 let display = if is_cwd {
                     format!("{}● {}", icon, node.name)
                 } else {

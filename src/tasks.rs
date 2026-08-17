@@ -87,9 +87,7 @@ impl TaskWatcher {
         };
         let mut tasks: Vec<Task> = entries
             .flatten()
-            .filter(|e| {
-                e.path().extension().and_then(|x| x.to_str()) == Some("json")
-            })
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
             .filter_map(|e| parse_task(&std::fs::read(e.path()).ok()?))
             .collect();
         // Numeric order, so "10" does not sort before "2".
@@ -194,6 +192,9 @@ mod tests {
         assert_eq!(poll_now(&mut w, Some("abc"))[0].status, TaskStatus::Pending);
 
         write_task(&session, "1", "flip", "completed");
-        assert_eq!(poll_now(&mut w, Some("abc"))[0].status, TaskStatus::Completed);
+        assert_eq!(
+            poll_now(&mut w, Some("abc"))[0].status,
+            TaskStatus::Completed
+        );
     }
 }

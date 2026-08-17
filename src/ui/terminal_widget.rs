@@ -133,9 +133,7 @@ impl<'a> Widget for TerminalWidget<'a> {
         // returns None otherwise), so Claude Code's alt-screen UI is never
         // covered and the live view keeps its full width.
         if area.width > 0 {
-            if let Some((thumb_pos, thumb_height)) =
-                vterm.scrollbar_thumb(area.height as usize)
-            {
+            if let Some((thumb_pos, thumb_height)) = vterm.scrollbar_thumb(area.height as usize) {
                 let x = area.x + area.width - 1;
                 for y in 0..area.height as usize {
                     let on_thumb = y >= thumb_pos && y < thumb_pos + thumb_height;

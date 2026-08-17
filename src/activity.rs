@@ -514,11 +514,26 @@ mod tests {
     /// a path already in the tree reads as an edit to the user.
     #[test]
     fn write_classifies_by_whether_the_file_already_existed() {
-        assert_eq!(FileAction::classify(ActivityKind::Write, false), FileAction::Create);
-        assert_eq!(FileAction::classify(ActivityKind::Write, true), FileAction::Overwrite);
-        assert_eq!(FileAction::classify(ActivityKind::Edit, true), FileAction::Edit);
-        assert_eq!(FileAction::classify(ActivityKind::Edit, false), FileAction::Edit);
-        assert_eq!(FileAction::classify(ActivityKind::Read, true), FileAction::Read);
+        assert_eq!(
+            FileAction::classify(ActivityKind::Write, false),
+            FileAction::Create
+        );
+        assert_eq!(
+            FileAction::classify(ActivityKind::Write, true),
+            FileAction::Overwrite
+        );
+        assert_eq!(
+            FileAction::classify(ActivityKind::Edit, true),
+            FileAction::Edit
+        );
+        assert_eq!(
+            FileAction::classify(ActivityKind::Edit, false),
+            FileAction::Edit
+        );
+        assert_eq!(
+            FileAction::classify(ActivityKind::Read, true),
+            FileAction::Read
+        );
     }
 
     #[test]
@@ -577,10 +592,22 @@ mod tests {
                 r#"{{"message":{{"content":[{{"type":"tool_use","name":"{tool}","input":{{"file_path":"/r/a.rs"}}}}]}}}}"#
             )
         };
-        assert_eq!(parse_line(mk("Read").as_bytes(), root).files[0].kind, ActivityKind::Read);
-        assert_eq!(parse_line(mk("Edit").as_bytes(), root).files[0].kind, ActivityKind::Edit);
-        assert_eq!(parse_line(mk("MultiEdit").as_bytes(), root).files[0].kind, ActivityKind::Edit);
-        assert_eq!(parse_line(mk("Write").as_bytes(), root).files[0].kind, ActivityKind::Write);
+        assert_eq!(
+            parse_line(mk("Read").as_bytes(), root).files[0].kind,
+            ActivityKind::Read
+        );
+        assert_eq!(
+            parse_line(mk("Edit").as_bytes(), root).files[0].kind,
+            ActivityKind::Edit
+        );
+        assert_eq!(
+            parse_line(mk("MultiEdit").as_bytes(), root).files[0].kind,
+            ActivityKind::Edit
+        );
+        assert_eq!(
+            parse_line(mk("Write").as_bytes(), root).files[0].kind,
+            ActivityKind::Write
+        );
     }
 
     /// Bash carries a human-written description; that is the label. A raw
@@ -592,7 +619,9 @@ mod tests {
         let with = br#"{"message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git fetch origin","description":"Fetch origin and compare"}}]}}"#;
         let got = parse_line(with, root);
         assert_eq!(got.events.len(), 1);
-        assert!(matches!(&got.events[0], Event::Command { label } if label == "Fetch origin and compare"));
+        assert!(
+            matches!(&got.events[0], Event::Command { label } if label == "Fetch origin and compare")
+        );
 
         let without = br#"{"message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la"}}]}}"#;
         let got = parse_line(without, root);
@@ -603,7 +632,9 @@ mod tests {
             "x".repeat(200)
         );
         let got = parse_line(long.as_bytes(), root);
-        let Event::Command { label } = &got.events[0] else { panic!("command") };
+        let Event::Command { label } = &got.events[0] else {
+            panic!("command")
+        };
         assert!(label.chars().count() <= 61, "60 chars plus the ellipsis");
         assert!(label.ends_with('…'));
     }
@@ -617,7 +648,10 @@ mod tests {
             Event::Search { pattern } if pattern == "scrollbar_thumb"
         ));
         let glob = br#"{"message":{"content":[{"type":"tool_use","name":"Glob","input":{"pattern":"**/*.rs"}}]}}"#;
-        assert!(matches!(&parse_line(glob, root).events[0], Event::Search { .. }));
+        assert!(matches!(
+            &parse_line(glob, root).events[0],
+            Event::Search { .. }
+        ));
         let agent = br#"{"message":{"content":[{"type":"tool_use","name":"Agent","input":{"description":"Review Task 3","prompt":"..."}}]}}"#;
         assert!(matches!(
             &parse_line(agent, root).events[0],
@@ -655,8 +689,12 @@ mod tests {
         assert!(empty(br#"{"message":{"content":"a string"}}"#));
         assert!(empty(br#"{"message":{"content":[{"type":"tool_use"}]}}"#));
         assert!(empty(br#"{"message":null}"#));
-        assert!(empty(br#"{"message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#));
-        assert!(empty(br#"{"message":{"content":[{"type":"tool_use","name":"Grep","input":{}}]}}"#));
+        assert!(empty(
+            br#"{"message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#
+        ));
+        assert!(empty(
+            br#"{"message":{"content":[{"type":"tool_use","name":"Grep","input":{}}]}}"#
+        ));
     }
 
     fn write_line(path: &Path, tool: &str, file: &str) {
@@ -740,7 +778,11 @@ mod tests {
         drop(f);
 
         let got = poll_now(&mut w);
-        assert_eq!(got.files.len(), 1, "completed line should parse exactly once");
+        assert_eq!(
+            got.files.len(),
+            1,
+            "completed line should parse exactly once"
+        );
         assert_eq!(got.files[0].path, root.join("a.rs"));
     }
 

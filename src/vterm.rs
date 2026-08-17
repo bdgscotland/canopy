@@ -397,8 +397,7 @@ impl VirtualTerminal {
         if crate::scrollbar::thumb(total, visible_height, 0).is_none() {
             return;
         }
-        let offset_from_top =
-            crate::scrollbar::offset_for_thumb_pos(row, total, visible_height);
+        let offset_from_top = crate::scrollbar::offset_for_thumb_pos(row, total, visible_height);
         let max_offset = total.saturating_sub(visible_height);
         self.set_scroll_offset(max_offset.saturating_sub(offset_from_top));
     }

@@ -123,7 +123,9 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
                 .and_then(|(p, kind)| (p == node.path).then_some(kind));
 
             let active_bg = match active {
-                Some(ActivityKind::Write) | Some(ActivityKind::Edit) => Some(Color::Rgb(72, 52, 20)),
+                Some(ActivityKind::Write) | Some(ActivityKind::Edit) => {
+                    Some(Color::Rgb(72, 52, 20))
+                }
                 Some(ActivityKind::Read) => Some(Color::Rgb(34, 42, 56)),
                 None => None,
             };
@@ -199,15 +201,11 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
                         ("📝", Style::default())
                     }
                     (Fade::Bright, FileAction::Read) => ("👀", Style::default()),
-                    (Fade::Dim, FileAction::Create) => {
-                        ("+", Style::default().fg(Color::DarkGray))
-                    }
+                    (Fade::Dim, FileAction::Create) => ("+", Style::default().fg(Color::DarkGray)),
                     (Fade::Dim, FileAction::Edit | FileAction::Overwrite) => {
                         ("✎", Style::default().fg(Color::DarkGray))
                     }
-                    (Fade::Dim, FileAction::Read) => {
-                        ("·", Style::default().fg(Color::DarkGray))
-                    }
+                    (Fade::Dim, FileAction::Read) => ("·", Style::default().fg(Color::DarkGray)),
                 };
                 segments.push((format!(" {glyph}"), style));
             }
@@ -379,10 +377,13 @@ mod width_tests {
     #[test]
     fn a_shifted_row_starts_mid_line() {
         let buf = render_tree_at(12, 8);
-        let found = (0..10).map(|y| row_text(&buf, 12, y)).any(|line| {
-            line.starts_with("file_node")
-        });
-        assert!(found, "shift of 8 must land exactly on the deep file's name");
+        let found = (0..10)
+            .map(|y| row_text(&buf, 12, y))
+            .any(|line| line.starts_with("file_node"));
+        assert!(
+            found,
+            "shift of 8 must land exactly on the deep file's name"
+        );
     }
 
     #[test]
@@ -460,7 +461,7 @@ mod glyph_tests {
 
         // The tempdir path varies per run; key the map on the real path.
         let mut keyed = HashMap::new();
-        for (_, v) in recent {
+        for v in recent.values() {
             keyed.insert(d.path().join(root_file), *v);
         }
 
@@ -485,7 +486,10 @@ mod glyph_tests {
         recent.insert(PathBuf::new(), (FileAction::Edit, Fade::Bright));
         let rows = render_with(&recent, "touched.rs", 30);
         let row = rows.iter().find(|r| r.contains("touched.rs")).unwrap();
-        assert!(row.contains("touched.rs 📝"), "glyph after the name: {row:?}");
+        assert!(
+            row.contains("touched.rs 📝"),
+            "glyph after the name: {row:?}"
+        );
     }
 
     #[test]

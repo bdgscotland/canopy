@@ -35,7 +35,13 @@ impl<'a> Widget for ActivityPaneWidget<'a> {
         let width = area.width as usize;
 
         if let Some(now) = self.now {
-            buf.set_stringn(area.x, y, now, width, Style::default().fg(Color::White).bold());
+            buf.set_stringn(
+                area.x,
+                y,
+                now,
+                width,
+                Style::default().fg(Color::White).bold(),
+            );
             y += 1;
         }
 
@@ -63,9 +69,7 @@ impl<'a> Widget for ActivityPaneWidget<'a> {
             shown = self
                 .tasks
                 .iter()
-                .filter(|t| {
-                    live.iter().any(|l| l.id == t.id) || done.iter().any(|d| d.id == t.id)
-                })
+                .filter(|t| live.iter().any(|l| l.id == t.id) || done.iter().any(|d| d.id == t.id))
                 .collect();
             for t in &shown {
                 if y >= bottom {
@@ -103,7 +107,11 @@ fn render_task(buf: &mut Buffer, x: u16, y: u16, width: usize, t: &Task) {
             t.active_form.as_str(),
             Style::default().fg(Color::Rgb(255, 214, 120)).bold(),
         ),
-        TaskStatus::Completed => ("☑", t.subject.as_str(), Style::default().fg(Color::DarkGray)),
+        TaskStatus::Completed => (
+            "☑",
+            t.subject.as_str(),
+            Style::default().fg(Color::DarkGray),
+        ),
     };
     buf.set_stringn(x, y, format!("{glyph} {text}"), width, style);
 }

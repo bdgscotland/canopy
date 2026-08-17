@@ -198,8 +198,7 @@ impl FileTree {
         if self.scrollbar_thumb(visible_height).is_none() {
             return;
         }
-        self.offset =
-            crate::scrollbar::offset_for_thumb_pos(row, self.nodes.len(), visible_height);
+        self.offset = crate::scrollbar::offset_for_thumb_pos(row, self.nodes.len(), visible_height);
     }
 
     /// Page up or down, for a click on the scrollbar track above or below the
@@ -1153,9 +1152,17 @@ mod hscrollbar_tests {
         let mut t = wide_tree();
         let visible = 20;
         t.hpage(true, visible);
-        assert_eq!(t.h_offset(), t.content_width() - visible, "one page covers it");
+        assert_eq!(
+            t.h_offset(),
+            t.content_width() - visible,
+            "one page covers it"
+        );
         t.hpage(true, visible);
-        assert_eq!(t.h_offset(), t.content_width() - visible, "clamped at the end");
+        assert_eq!(
+            t.h_offset(),
+            t.content_width() - visible,
+            "clamped at the end"
+        );
         t.hpage(false, visible);
         assert_eq!(t.h_offset(), 0);
     }

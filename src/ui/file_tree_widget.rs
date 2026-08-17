@@ -113,7 +113,7 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
                 .and_then(|(p, kind)| (p == node.path).then_some(kind));
 
             let active_bg = match active {
-                Some(ActivityKind::Write) => Some(Color::Rgb(72, 52, 20)),
+                Some(ActivityKind::Write) | Some(ActivityKind::Edit) => Some(Color::Rgb(72, 52, 20)),
                 Some(ActivityKind::Read) => Some(Color::Rgb(34, 42, 56)),
                 None => None,
             };
@@ -136,7 +136,7 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
             let tree_style = Style::default().fg(Color::DarkGray);
             let node_style = if let (Some(kind), Some(bg)) = (active, active_bg) {
                 match kind {
-                    ActivityKind::Write => {
+                    ActivityKind::Write | ActivityKind::Edit => {
                         Style::default().bg(bg).fg(Color::Rgb(255, 214, 120)).bold()
                     }
                     ActivityKind::Read => Style::default().bg(bg).fg(Color::Rgb(150, 190, 240)),

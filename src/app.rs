@@ -296,8 +296,8 @@ impl App {
             }
         }
 
-        let events = self.activity.poll();
-        let Some(latest) = events.last() else {
+        let polled = self.activity.poll();
+        let Some(latest) = polled.files.last() else {
             return;
         };
 

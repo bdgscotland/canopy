@@ -112,6 +112,29 @@ impl App {
     ) -> Result<Self> {
         let canonical_path = path.canonicalize().unwrap_or(path);
 
+        // Pin the child to a session id WE choose, by passing --session-id
+        // to the claude we spawn. Discovery-by-newest is a race: several
+        // sessions routinely share one project directory (other terminals,
+        // cloud agents, path-mangling collisions), and whichever wrote last
+        // won — so the tree followed a stranger while the session on screen
+        // went unseen. An explicit CANOPY_SESSION_ID pins without injecting
+        // (that session already exists); user args that pick the session
+        // (--resume/--continue) and non-stock CANOPY_COMMANDs, which may not
+        // accept the flag, keep the old discovery.
+        let mut claude_args = claude_args;
+        let pinned = std::env::var("CANOPY_SESSION_ID").ok().or_else(|| {
+            let stock_claude = std::env::var("CANOPY_COMMAND")
+                .map(|c| std::path::Path::new(&c).file_name() == Some("claude".as_ref()))
+                .unwrap_or(true);
+            if !stock_claude || crate::activity::steers_session(&claude_args) {
+                return None;
+            }
+            let id = crate::activity::generate_session_id()?;
+            claude_args.push("--session-id".to_string());
+            claude_args.push(id.clone());
+            Some(id)
+        });
+
         // Open the PTY FIRST. Rust evaluates struct fields in source order, so
         // building the tree here meant Claude did not start until the walk
         // finished -- 443 ms on a 20k-node repo before the walk was rewritten,
@@ -137,10 +160,7 @@ impl App {
             hscrollbar_grab: None,
             terminal_scrollbar_grab: None,
             last_auto_scroll_cwd: None,
-            activity: ActivityWatcher::new(
-                &canonical_path,
-                std::env::var("CANOPY_SESSION_ID").ok(),
-            ),
+            activity: ActivityWatcher::new(&canonical_path, pinned),
             highlight: None,
             recent_activity: HashMap::new(),
             now: None,

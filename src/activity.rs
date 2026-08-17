@@ -160,6 +160,71 @@ fn projects_dir(root: &Path) -> Option<PathBuf> {
 /// directory for the most recently modified transcript whose first line reports
 /// this `cwd`. Covers Claude's name truncation, a changed mangling scheme, and
 /// any case our reimplementation gets wrong.
+/// A transcript's recorded working directory. Sessions open with several
+/// bookkeeping records (`last-prompt`, `mode`, `file-history-snapshot`)
+/// that carry no `cwd`, so the first line alone is not enough — a real
+/// session's cwd routinely first appears a few lines in.
+pub(crate) fn transcript_cwd(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    for _ in 0..20 {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let cwd = serde_json::from_str::<serde_json::Value>(&line)
+            .ok()
+            .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(String::from));
+        if cwd.is_some() {
+            return cwd;
+        }
+    }
+    None
+}
+
+/// A fresh v4 uuid for the Claude Code child we spawn. Assigning the id at
+/// launch is what makes transcript discovery deterministic: several
+/// sessions routinely share one project directory (other terminals, cloud
+/// agents, path-mangling collisions), and "newest .jsonl" follows
+/// whichever of them wrote last — not the session on screen.
+pub(crate) fn generate_session_id() -> Option<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    File::open("/dev/urandom")
+        .ok()?
+        .read_exact(&mut bytes)
+        .ok()?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = |r: std::ops::Range<usize>| -> String {
+        bytes[r].iter().map(|b| format!("{b:02x}")).collect()
+    };
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        hex(0..4),
+        hex(4..6),
+        hex(6..8),
+        hex(8..10),
+        hex(10..16)
+    ))
+}
+
+/// True when the user's own claude arguments already pick the session —
+/// resuming, continuing, or naming an id. Injecting ours would fight them,
+/// so those launches keep the old discovery behavior.
+pub(crate) fn steers_session(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        a == "-r"
+            || a == "-c"
+            || a == "--resume"
+            || a == "--continue"
+            || a == "--session-id"
+            || a.starts_with("--resume=")
+            || a.starts_with("--session-id=")
+    })
+}
+
 fn find_by_cwd(root: &Path) -> Option<PathBuf> {
     let projects = config_dir()?.join("projects");
     let want = root.to_string_lossy();
@@ -180,20 +245,9 @@ fn find_by_cwd(root: &Path) -> Option<PathBuf> {
             if best.as_ref().is_some_and(|(t, _)| modified <= *t) {
                 continue;
             }
-            // Only the first line is read, so this stays cheap even though some
-            // transcripts are megabytes.
-            let Ok(file) = File::open(&path) else {
-                continue;
-            };
-            let mut first = String::new();
-            if BufReader::new(file).read_line(&mut first).is_err() {
-                continue;
-            }
-            let matches = serde_json::from_str::<serde_json::Value>(&first)
-                .ok()
-                .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(String::from))
-                .is_some_and(|cwd| cwd == want);
-            if matches {
+            // Only the head of the file is read, so this stays cheap even
+            // though some transcripts are megabytes.
+            if transcript_cwd(&path).is_some_and(|cwd| cwd == want) {
                 best = Some((modified, path));
             }
         }
@@ -509,6 +563,60 @@ fn parse_line(bytes: &[u8], root: &Path) -> Polled {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sessions open with bookkeeping records (`last-prompt`, `mode`) that
+    /// carry no cwd, so reading only the first line missed real sessions.
+    #[test]
+    fn transcript_cwd_survives_preamble_records() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        std::fs::write(
+            &p,
+            concat!(
+                "{\"type\":\"last-prompt\"}\n",
+                "{\"type\":\"mode\",\"sessionId\":\"x\"}\n",
+                "{\"cwd\":\"/some/repo\",\"message\":null}\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(transcript_cwd(&p).as_deref(), Some("/some/repo"));
+
+        let none = d.path().join("none.jsonl");
+        std::fs::write(&none, "{}\n{}\n").unwrap();
+        assert!(transcript_cwd(&none).is_none());
+    }
+
+    #[test]
+    fn generated_session_ids_are_v4_uuids_and_unique() {
+        let a = generate_session_id().expect("urandom should exist");
+        let b = generate_session_id().expect("urandom should exist");
+        assert_ne!(a, b, "two ids must differ");
+        assert_eq!(a.len(), 36);
+        let parts: Vec<&str> = a.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
+        assert!(parts[2].starts_with('4'), "version nibble: {a}");
+        assert!(
+            matches!(parts[3].chars().next(), Some('8' | '9' | 'a' | 'b')),
+            "RFC 4122 variant: {a}"
+        );
+    }
+
+    #[test]
+    fn user_arguments_that_pick_a_session_disable_pinning() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        assert!(steers_session(&s(&["--resume", "abc"])));
+        assert!(steers_session(&s(&["--resume=abc"])));
+        assert!(steers_session(&s(&["-r"])));
+        assert!(steers_session(&s(&["--continue"])));
+        assert!(steers_session(&s(&["-c"])));
+        assert!(steers_session(&s(&["--session-id", "x"])));
+        assert!(steers_session(&s(&["--session-id=x"])));
+        assert!(!steers_session(&s(&["--model", "opus"])));
+        assert!(!steers_session(&s(&[])));
+    }
 
     /// Write is create-or-overwrite; only the tree knows which. A Write to
     /// a path already in the tree reads as an edit to the user.

@@ -1,3 +1,4 @@
+mod activity_pane;
 mod file_tree_widget;
 mod terminal_widget;
 

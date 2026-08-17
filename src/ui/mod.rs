@@ -6,8 +6,12 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Paragraph},
 };
+use std::collections::HashMap;
 
+use crate::activity::{Fade, GLYPH_BRIGHT, GLYPH_EXPIRY, NOW_STALE};
 use crate::app::App;
+use crate::tasks::TaskStatus;
+use activity_pane::{content_height, ActivityPaneWidget};
 use file_tree_widget::FileTreeWidget;
 use terminal_widget::TerminalWidget;
 
@@ -88,8 +92,36 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    // File tree pane (right side)
-    let tree_area = chunks[1];
+    // Right column: tree above, activity pane below. The pane exists only
+    // when it has something to say -- an empty bordered box under the tree
+    // would be pure noise -- so an idle session looks exactly like today.
+    let right = chunks[1];
+
+    let now_line: Option<String> = app
+        .now
+        .as_ref()
+        .filter(|(_, t)| t.elapsed() < NOW_STALE)
+        .map(|(label, _)| label.clone())
+        .or_else(|| {
+            // Tools have gone quiet; the in-progress task is the best
+            // description of what Claude is doing.
+            app.tasks
+                .iter()
+                .find(|t| t.status == TaskStatus::InProgress)
+                .map(|t| format!("◐ {}", t.active_form))
+        });
+
+    let cap = (right.height * 2) / 5; // spec: at most 40% of the column
+    let pane_rows = content_height(now_line.is_some(), app.tasks.len(), cap);
+    let (tree_area, pane_area) = if pane_rows == 0 {
+        (right, None)
+    } else {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(pane_rows + 2)])
+            .split(right);
+        (split[0], Some(split[1]))
+    };
 
     let tree_name = app
         .tree
@@ -157,15 +189,46 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.last_auto_scroll_cwd = Some(cwd.to_path_buf());
         }
 
+        // Fade is computed here, once per frame, so the widget itself
+        // never consults a clock and stays deterministic under test.
+        let recent: HashMap<std::path::PathBuf, (crate::activity::FileAction, Fade)> = app
+            .recent_activity
+            .iter()
+            .filter(|(_, (_, t))| t.elapsed() < GLYPH_EXPIRY)
+            .map(|(p, (action, t))| {
+                let fade = if t.elapsed() < GLYPH_BRIGHT {
+                    Fade::Bright
+                } else {
+                    Fade::Dim
+                };
+                (p.clone(), (*action, fade))
+            })
+            .collect();
+
         // Render file tree
         let file_tree_widget = FileTreeWidget::new(&app.tree, Some(app.terminal.cwd()))
-            .highlight(app.highlight.as_ref().map(|(p, k)| (p.as_path(), *k)));
+            .highlight(app.highlight.as_ref().map(|(p, k)| (p.as_path(), *k)))
+            .recent(&recent);
         frame.render_stateful_widget(
             file_tree_widget,
             tree_inner,
             &mut FileTreeWidgetState {
                 offset: app.tree.offset(),
             },
+        );
+    }
+
+    if let Some(pane_area) = pane_area {
+        let pane_block = Block::default()
+            .title(" claude ")
+            .title_style(Style::default().fg(Color::Cyan))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let pane_inner = pane_block.inner(pane_area);
+        frame.render_widget(pane_block, pane_area);
+        frame.render_widget(
+            ActivityPaneWidget::new(now_line.as_deref(), &app.tasks),
+            pane_inner,
         );
     }
 }

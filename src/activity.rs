@@ -49,6 +49,42 @@ pub struct Activity {
     pub kind: ActivityKind,
 }
 
+/// What actually happened to a file, once the tree has said whether the
+/// path already existed. Drives the per-file glyph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAction {
+    Read,
+    Edit,
+    Create,
+    Overwrite,
+}
+
+impl FileAction {
+    pub fn classify(kind: ActivityKind, existed: bool) -> Self {
+        match kind {
+            ActivityKind::Read => Self::Read,
+            ActivityKind::Edit => Self::Edit,
+            ActivityKind::Write if existed => Self::Overwrite,
+            ActivityKind::Write => Self::Create,
+        }
+    }
+}
+
+/// How strongly a glyph renders, by age. Computed at draw time so the
+/// widget itself stays clock-free and testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fade {
+    Bright,
+    Dim,
+}
+
+/// Glyphs are full-color this long...
+pub const GLYPH_BRIGHT: Duration = Duration::from_secs(10);
+/// ...dim after that, gone after this.
+pub const GLYPH_EXPIRY: Duration = Duration::from_secs(60);
+/// A now-line older than this defers to the in-progress task instead.
+pub const NOW_STALE: Duration = Duration::from_secs(30);
+
 /// A non-file action worth narrating: what Claude is doing, not just what
 /// it touched. Labels are display-ready strings because the transcript is
 /// the only place the human-written descriptions exist.
@@ -471,6 +507,17 @@ fn parse_line(bytes: &[u8], root: &Path) -> Polled {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write is create-or-overwrite; only the tree knows which. A Write to
+    /// a path already in the tree reads as an edit to the user.
+    #[test]
+    fn write_classifies_by_whether_the_file_already_existed() {
+        assert_eq!(FileAction::classify(ActivityKind::Write, false), FileAction::Create);
+        assert_eq!(FileAction::classify(ActivityKind::Write, true), FileAction::Overwrite);
+        assert_eq!(FileAction::classify(ActivityKind::Edit, true), FileAction::Edit);
+        assert_eq!(FileAction::classify(ActivityKind::Edit, false), FileAction::Edit);
+        assert_eq!(FileAction::classify(ActivityKind::Read, true), FileAction::Read);
+    }
 
     #[test]
     fn mangles_project_path_like_claude_does() {

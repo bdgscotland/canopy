@@ -1,6 +1,7 @@
 use anyhow::Result;
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::prelude::Rect;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -14,7 +15,8 @@ const REFRESH_THROTTLE: Duration = Duration::from_millis(250);
 /// hostage by it, and its late result is discarded by generation.
 const WALK_TIMEOUT: Duration = Duration::from_secs(10);
 
-use crate::activity::{ActivityKind, ActivityWatcher};
+use crate::activity::{ActivityKind, ActivityWatcher, Event, FileAction, GLYPH_EXPIRY};
+use crate::tasks::{Task, TaskWatcher};
 use crate::terminal::TerminalPane;
 use crate::tree::FileNode;
 use crate::tree::FileTree;
@@ -58,6 +60,13 @@ pub struct App {
     /// The file Claude touched most recently, and how. Persists until the next
     /// event supersedes it — no fade timer, so nothing runs while idle.
     pub highlight: Option<(PathBuf, ActivityKind)>,
+    /// Files Claude touched recently and how, pruned past GLYPH_EXPIRY.
+    /// Feeds the per-file glyphs; `highlight` stays the single loud row.
+    pub recent_activity: HashMap<PathBuf, (FileAction, Instant)>,
+    /// The latest narratable action, display-ready ("⚒ Run the tests").
+    pub now: Option<(String, Instant)>,
+    pub tasks: Vec<Task>,
+    task_watcher: TaskWatcher,
     /// Set when a revealed path was not in the tree, so the next tick rebuilds
     /// and retries. Claude creating a file is the common case.
     pending_reveal: Option<PathBuf>,
@@ -133,6 +142,10 @@ impl App {
                 std::env::var("CANOPY_SESSION_ID").ok(),
             ),
             highlight: None,
+            recent_activity: HashMap::new(),
+            now: None,
+            tasks: Vec::new(),
+            task_watcher: TaskWatcher::new(),
             pending_reveal: None,
             last_refresh: Instant::now(),
             refresh_queued: false,
@@ -169,6 +182,11 @@ impl App {
         }
         self.drain_walks();
         self.poll_activity();
+
+        self.tasks = self
+            .task_watcher
+            .poll(self.activity.session_id().as_deref())
+            .to_vec();
 
         // Process clipboard requests from vterm (OSC 52)
         {
@@ -297,10 +315,39 @@ impl App {
         }
 
         let polled = self.activity.poll();
+
+        // Narrate the newest event. A file touch also narrates, but a
+        // command/search/agent event is more specific, so it wins the tie
+        // within one poll.
+        let now = Instant::now();
+        if let Some(event) = polled.events.last() {
+            let label = match event {
+                Event::Command { label } => format!("⚒ {label}"),
+                Event::Search { pattern } => format!("🔍 {pattern}"),
+                Event::Agent { label } => format!("⧉ {label}"),
+            };
+            self.now = Some((label, now));
+        } else if let Some(f) = polled.files.last() {
+            let shown = f
+                .path
+                .strip_prefix(self.tree.root_path())
+                .unwrap_or(&f.path);
+            self.now = Some((format!("✎ {}", shown.display()), now));
+        }
+
+        // Classify BEFORE reveal_ancestors/request_refresh can add the file
+        // to the tree: existence-now is what separates create from overwrite.
+        for f in &polled.files {
+            let existed = self.tree.nodes().iter().any(|n| n.path == f.path);
+            self.recent_activity
+                .insert(f.path.clone(), (FileAction::classify(f.kind, existed), now));
+        }
+        self.recent_activity
+            .retain(|_, (_, t)| t.elapsed() < GLYPH_EXPIRY);
+
         let Some(latest) = polled.files.last() else {
             return;
         };
-
         self.highlight = Some((latest.path.clone(), latest.kind));
 
         // Open whatever is hiding it. Must happen BEFORE request_refresh, which

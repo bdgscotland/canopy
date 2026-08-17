@@ -101,7 +101,7 @@ fn mangle_project_path(root: &Path) -> String {
 }
 
 /// Claude Code resolves its config root as `CLAUDE_CONFIG_DIR ?? ~/.claude`.
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         if !dir.is_empty() {
             return Some(PathBuf::from(dir));

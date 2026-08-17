@@ -3,6 +3,7 @@ mod app;
 mod event;
 mod ptywrite;
 mod scrollbar;
+mod tasks;
 mod terminal;
 mod tree;
 mod ui;

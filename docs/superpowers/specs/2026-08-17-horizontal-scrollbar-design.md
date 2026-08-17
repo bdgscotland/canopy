@@ -1,7 +1,7 @@
-# Horizontal scrollbar for the file tree
+# Horizontal scrollbar for the file tree; terminal-pane scrollbar
 
 **Date:** 2026-08-17
-**Status:** Approved (approach A)
+**Status:** Approved (approach A, extended)
 
 ## Problem
 
@@ -9,6 +9,13 @@ Long paths in the tree pane are truncated with a `…` marker. Once a name is
 cut off there is no way to read the rest of it short of widening the pane.
 The tree needs a horizontal scrollbar, matching the mouse-driven vertical
 scrollbar added in `037762e`/`114268d`.
+
+Additionally (added during planning): scrollbars should be mouse-usable on
+*either* pane. The terminal pane has wheel-driven scrollback but no drawn
+scrollbar at all, so there is nothing to grab. It gets one — see
+"Terminal-pane scrollbar" below. Horizontal scrolling does not apply to the
+terminal pane: the PTY is resized to the pane width, so its content never
+overflows horizontally.
 
 ## Approach
 
@@ -94,6 +101,54 @@ the grab offset within the thumb.
   `h_offset` by 3 columns, clamped — symmetric with the vertical wheel's
   3-row step.
 
+## Shared geometry helper
+
+The vertical tree scrollbar, the new horizontal tree scrollbar, and the new
+terminal scrollbar all need the same thumb arithmetic. Rather than a third
+copy, the math moves to a free module `src/scrollbar.rs` (declared in both
+`lib.rs` and `main.rs`, since `tree` and `vterm` live in both crate roots):
+
+- `thumb(total, visible, offset) -> Option<(pos, len)>` — `None` when
+  `visible == 0` or `total <= visible`; thumb length
+  `(visible² / total).max(1)`; position proportional to
+  `offset / (total - visible)` over the travel, clamped.
+- `offset_for_thumb_pos(pos, total, visible) -> usize` — the inverse, for
+  drags.
+
+`FileTree::scrollbar_thumb` / `scroll_to_thumb_row` delegate to these; the
+existing `scrollbar_tests` pin that the delegation changes nothing.
+
+## Terminal-pane scrollbar
+
+A vertical scrollbar for the terminal pane's scrollback, mouse-usable like
+the tree's.
+
+**Visibility:** drawn only on the primary screen while scrolled back
+(`!in_alternate_screen() && scroll_offset() > 0`). Claude Code runs on the
+alt screen, where the wheel is already translated to arrow keys and there
+is no scrollback to scroll — no bar there, ever. At the live bottom
+(`scroll_offset == 0`) the bar disappears rather than permanently covering
+the pane's last column; wheel up to enter scrollback and it appears.
+
+**Geometry** lives on `VirtualTerminal`, next to the scroll state it reads:
+
+- `scrollbar_thumb(visible_height) -> Option<(pos, len)>` — `None` when
+  hidden per the rule above; otherwise `thumb(total, visible, offset_from_top)`
+  where `total = scrollback.len() + grid.len()` and
+  `offset_from_top = total - visible - scroll_offset` (saturating).
+- `scroll_to_thumb_row(row, visible_height)` — inverts via
+  `offset_for_thumb_pos` and stores the result back as a bottom-relative
+  `scroll_offset`, clamped by the existing `set_scroll_offset`.
+
+**Rendering** (`terminal_widget.rs`): same glyphs and colors as the tree's
+bar (`█` thumb, `░` track), overlaying the last column of the pane.
+
+**Mouse** (`app.rs`): a `terminal_scrollbar_grab: Option<usize>` mirroring
+the tree's. Mouse-down on the last column while the bar is visible grabs
+the thumb or pages toward the click, and does *not* set the selection
+anchor; drag moves the thumb; mouse-up clears the grab. Everything else
+(selection, wheel) is unchanged.
+
 ## Error handling
 
 All arithmetic is saturating/clamped as in the vertical code; a pane of
@@ -111,3 +166,8 @@ names slice by display width, never by byte index.
   pane; the bar appears only on overflow and leaves the corner cell alone.
 - Mouse test: a click on the bottom row with the bar visible does not
   select a node.
+- `src/scrollbar.rs` unit tests: no thumb when content fits; thumb inside
+  the track at every offset; `offset_for_thumb_pos` round-trips `thumb`.
+- `vterm` tests: no thumb on the alt screen; no thumb at the live bottom;
+  thumb appears when scrolled back; `scroll_to_thumb_row` at the track top
+  reaches the oldest line and at the bottom returns to live.

@@ -50,6 +50,8 @@ pub struct App {
     /// Grab offset within the HORIZONTAL scrollbar thumb, same idea as
     /// scrollbar_grab one axis over.
     hscrollbar_grab: Option<usize>,
+    /// Grab offset within the TERMINAL pane's scrollbar thumb.
+    terminal_scrollbar_grab: Option<usize>,
     pub last_auto_scroll_cwd: Option<PathBuf>,
     /// Follows Claude's session transcript.
     pub activity: ActivityWatcher,
@@ -124,6 +126,7 @@ impl App {
             drag_anchor: None,
             scrollbar_grab: None,
             hscrollbar_grab: None,
+            terminal_scrollbar_grab: None,
             last_auto_scroll_cwd: None,
             activity: ActivityWatcher::new(
                 &canonical_path,
@@ -391,6 +394,10 @@ impl App {
                 // terminal does. The anchor is remembered, but no selection
                 // exists until the pointer actually moves.
                 self.selection = None;
+                if in_terminal && self.terminal_scrollbar_down(event) {
+                    self.drag_anchor = None;
+                    return;
+                }
                 self.drag_anchor = if in_terminal {
                     self.terminal_point(event.column, event.row)
                 } else {
@@ -469,6 +476,15 @@ impl App {
                     }
                     return;
                 }
+                if let Some(grab) = self.terminal_scrollbar_grab {
+                    if let Some(area) = self.terminal_area {
+                        let row = event.row.saturating_sub(area.y) as usize;
+                        self.terminal
+                            .vterm_lock()
+                            .scroll_to_thumb_row(row.saturating_sub(grab), area.height as usize);
+                    }
+                    return;
+                }
                 if let Some(anchor) = self.drag_anchor {
                     if let Some(point) = self.terminal_point(event.column, event.row) {
                         if point != anchor {
@@ -486,6 +502,7 @@ impl App {
                 self.drag_anchor = None;
                 self.scrollbar_grab = None;
                 self.hscrollbar_grab = None;
+                self.terminal_scrollbar_grab = None;
                 if let Some(sel) = self.selection.as_ref() {
                     let text = self.terminal.extract_text(sel.start, sel.end);
                     if !text.is_empty() {
@@ -495,6 +512,39 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// A left-click on the terminal pane's scrollbar, if the bar is
+    /// visible and the click is on its column. Returns true when handled,
+    /// so the caller skips selection -- grabbing the bar must not start
+    /// highlighting text underneath it.
+    fn terminal_scrollbar_down(&mut self, event: MouseEvent) -> bool {
+        let Some(area) = self.terminal_area else {
+            return false;
+        };
+        if area.width == 0 || event.column != area.x + area.width - 1 {
+            return false;
+        }
+        let visible = area.height as usize;
+        let row = event.row.saturating_sub(area.y) as usize;
+        let mut vt = self.terminal.vterm_lock();
+        let Some((pos, height)) = vt.scrollbar_thumb(visible) else {
+            return false;
+        };
+        if row >= pos && row < pos + height {
+            drop(vt);
+            self.terminal_scrollbar_grab = Some(row - pos);
+        } else if row > pos {
+            // Track below the thumb: page DOWN, toward live.
+            let current = vt.scroll_offset();
+            vt.set_scroll_offset(current.saturating_sub(visible));
+        } else {
+            // Track above the thumb: page UP, into history. set_scroll_offset
+            // clamps to the history length.
+            let current = vt.scroll_offset();
+            vt.set_scroll_offset(current + visible);
+        }
+        true
     }
 
     /// Map a mouse position to (column, absolute line), clamped to the pane.

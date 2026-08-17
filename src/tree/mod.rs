@@ -183,37 +183,16 @@ impl FileTree {
     /// this arithmetic would drift, and the click would stop landing where the
     /// thumb is drawn.
     pub fn scrollbar_thumb(&self, visible_height: usize) -> Option<(usize, usize)> {
-        let total = self.nodes.len();
-        if visible_height == 0 || total <= visible_height {
-            return None;
-        }
-        let height = ((visible_height * visible_height) / total).max(1);
-        let max_offset = total.saturating_sub(visible_height);
-        let travel = visible_height.saturating_sub(height);
-        let pos = if max_offset == 0 {
-            0
-        } else {
-            (self.offset * travel) / max_offset
-        };
-        Some((pos.min(travel), height))
+        crate::scrollbar::thumb(self.nodes.len(), visible_height, self.offset)
     }
 
     /// Scroll so the thumb's TOP lands on `row`, clamped. Used for a drag.
     pub fn scroll_to_thumb_row(&mut self, row: usize, visible_height: usize) {
-        let total = self.nodes.len();
-        if visible_height == 0 || total <= visible_height {
+        if self.scrollbar_thumb(visible_height).is_none() {
             return;
         }
-        let Some((_, height)) = self.scrollbar_thumb(visible_height) else {
-            return;
-        };
-        let max_offset = total.saturating_sub(visible_height);
-        let travel = visible_height.saturating_sub(height);
-        self.offset = if travel == 0 {
-            0
-        } else {
-            (row.min(travel) * max_offset) / travel
-        };
+        self.offset =
+            crate::scrollbar::offset_for_thumb_pos(row, self.nodes.len(), visible_height);
     }
 
     /// Page up or down, for a click on the scrollbar track above or below the

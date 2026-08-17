@@ -47,6 +47,9 @@ pub struct App {
     /// relative to where it was grabbed rather than snapping its top to the
     /// pointer.
     scrollbar_grab: Option<usize>,
+    /// Grab offset within the HORIZONTAL scrollbar thumb, same idea as
+    /// scrollbar_grab one axis over.
+    hscrollbar_grab: Option<usize>,
     pub last_auto_scroll_cwd: Option<PathBuf>,
     /// Follows Claude's session transcript.
     pub activity: ActivityWatcher,
@@ -120,6 +123,7 @@ impl App {
             selection: None,
             drag_anchor: None,
             scrollbar_grab: None,
+            hscrollbar_grab: None,
             last_auto_scroll_cwd: None,
             activity: ActivityWatcher::new(
                 &canonical_path,
@@ -366,6 +370,22 @@ impl App {
                     self.terminal.scroll_down();
                 }
             }
+            MouseEventKind::ScrollLeft => {
+                if in_tree {
+                    let h = self.tree.h_offset();
+                    self.tree.set_h_offset(h.saturating_sub(3));
+                }
+            }
+            MouseEventKind::ScrollRight => {
+                if in_tree {
+                    let visible = self
+                        .tree_area
+                        .map(|a| a.width.saturating_sub(1) as usize)
+                        .unwrap_or(1);
+                    let max = self.tree.content_width().saturating_sub(visible);
+                    self.tree.set_h_offset((self.tree.h_offset() + 3).min(max));
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 // Pressing anywhere clears the previous selection, as every
                 // terminal does. The anchor is remembered, but no selection
@@ -387,6 +407,11 @@ impl App {
                         let thumb = self.tree.scrollbar_thumb(visible);
                         let on_scrollbar =
                             area.width > 0 && event.column == area.x + area.width - 1;
+                        let track_width = area.width.saturating_sub(1) as usize;
+                        let hthumb = self.tree.hscrollbar_thumb(track_width);
+                        let on_hscrollbar = area.height > 0
+                            && event.row == area.y + area.height - 1
+                            && hthumb.is_some();
 
                         match (on_scrollbar, thumb) {
                             // Grabbed the thumb: remember where within it, so
@@ -397,9 +422,21 @@ impl App {
                             // Clicked the track: page toward the click, which
                             // is what every scrollbar does.
                             (true, Some((pos, _))) => self.tree.page(row > pos, visible),
-                            // Anywhere else: fold or unfold the row.
+                            // Anywhere else: the horizontal bar if it is
+                            // visible and this is its row, otherwise fold
+                            // or unfold the row. A click on the bar must
+                            // never fold the node hidden beneath it.
                             _ => {
-                                if let Some(path) =
+                                if on_hscrollbar {
+                                    let col = (event.column - area.x) as usize;
+                                    if let Some((pos, len)) = hthumb {
+                                        if col >= pos && col < pos + len {
+                                            self.hscrollbar_grab = Some(col - pos);
+                                        } else {
+                                            self.tree.hpage(col > pos, track_width);
+                                        }
+                                    }
+                                } else if let Some(path) =
                                     self.tree.node_at_row(row).map(|n| n.path.clone())
                                 {
                                     if self.tree.toggle(&path) {
@@ -423,6 +460,15 @@ impl App {
                     }
                     return;
                 }
+                if let Some(grab) = self.hscrollbar_grab {
+                    if let Some(area) = self.tree_area {
+                        let col = event.column.saturating_sub(area.x) as usize;
+                        let track_width = area.width.saturating_sub(1) as usize;
+                        self.tree
+                            .scroll_to_hthumb_col(col.saturating_sub(grab), track_width);
+                    }
+                    return;
+                }
                 if let Some(anchor) = self.drag_anchor {
                     if let Some(point) = self.terminal_point(event.column, event.row) {
                         if point != anchor {
@@ -439,6 +485,7 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag_anchor = None;
                 self.scrollbar_grab = None;
+                self.hscrollbar_grab = None;
                 if let Some(sel) = self.selection.as_ref() {
                     let text = self.terminal.extract_text(sel.start, sel.end);
                     if !text.is_empty() {

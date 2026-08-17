@@ -78,11 +78,13 @@ pub enum Fade {
     Dim,
 }
 
-/// Glyphs are full-color this long...
-pub const GLYPH_BRIGHT: Duration = Duration::from_secs(10);
-/// ...dim after that, gone after this.
-pub const GLYPH_EXPIRY: Duration = Duration::from_secs(60);
-/// A now-line older than this defers to the in-progress task instead.
+/// Glyphs render as emoji this long. Ten seconds proved too short in real
+/// use: Claude routinely sits in a single long tool call for minutes, so
+/// everything had faded before the user ever looked at the tree.
+pub const GLYPH_BRIGHT: Duration = Duration::from_secs(60);
+/// ...a dim text glyph after that, gone after this.
+pub const GLYPH_EXPIRY: Duration = Duration::from_secs(300);
+/// A now-line older than this is stale and stops rendering.
 pub const NOW_STALE: Duration = Duration::from_secs(30);
 
 /// A non-file action worth narrating: what Claude is doing, not just what

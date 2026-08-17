@@ -10,7 +10,6 @@ use std::collections::HashMap;
 
 use crate::activity::{Fade, GLYPH_BRIGHT, GLYPH_EXPIRY, NOW_STALE};
 use crate::app::App;
-use crate::tasks::TaskStatus;
 use activity_pane::{content_height, ActivityPaneWidget};
 use file_tree_widget::FileTreeWidget;
 use terminal_widget::TerminalWidget;
@@ -97,19 +96,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // would be pure noise -- so an idle session looks exactly like today.
     let right = chunks[1];
 
+    // No fallback to the in-progress task here: overflow drops completed
+    // rows first, so a ◐ task is effectively always visible in the list
+    // below, and the fallback only ever duplicated it.
     let now_line: Option<String> = app
         .now
         .as_ref()
         .filter(|(_, t)| t.elapsed() < NOW_STALE)
-        .map(|(label, _)| label.clone())
-        .or_else(|| {
-            // Tools have gone quiet; the in-progress task is the best
-            // description of what Claude is doing.
-            app.tasks
-                .iter()
-                .find(|t| t.status == TaskStatus::InProgress)
-                .map(|t| format!("◐ {}", t.active_form))
-        });
+        .map(|(label, _)| label.clone());
 
     let cap = (right.height * 2) / 5; // spec: at most 40% of the column
     let pane_rows = content_height(now_line.is_some(), app.tasks.len(), cap);

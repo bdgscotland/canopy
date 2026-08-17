@@ -189,20 +189,27 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
             // Trailing action glyph for recently-touched files. One more
             // segment, so shifting and truncation treat it like content.
             if let Some((action, fade)) = self.recent.and_then(|m| m.get(&node.path)) {
-                let glyph = match action {
-                    FileAction::Create => "+",
-                    FileAction::Edit | FileAction::Overwrite => "✎",
-                    FileAction::Read => "·",
-                };
-                let color = match (fade, action) {
-                    (Fade::Dim, _) => Color::DarkGray,
-                    (Fade::Bright, FileAction::Create) => Color::Green,
+                // Emoji while fresh, gray text once old: terminals render
+                // emoji in the font's own colors and ignore the foreground,
+                // so an emoji cannot fade -- it swaps to a dimmable glyph
+                // instead.
+                let (glyph, style) = match (fade, action) {
+                    (Fade::Bright, FileAction::Create) => ("✨", Style::default()),
                     (Fade::Bright, FileAction::Edit | FileAction::Overwrite) => {
-                        Color::Rgb(255, 214, 120)
+                        ("📝", Style::default())
                     }
-                    (Fade::Bright, FileAction::Read) => Color::Rgb(150, 190, 240),
+                    (Fade::Bright, FileAction::Read) => ("👀", Style::default()),
+                    (Fade::Dim, FileAction::Create) => {
+                        ("+", Style::default().fg(Color::DarkGray))
+                    }
+                    (Fade::Dim, FileAction::Edit | FileAction::Overwrite) => {
+                        ("✎", Style::default().fg(Color::DarkGray))
+                    }
+                    (Fade::Dim, FileAction::Read) => {
+                        ("·", Style::default().fg(Color::DarkGray))
+                    }
                 };
-                segments.push((format!(" {glyph}"), Style::default().fg(color)));
+                segments.push((format!(" {glyph}"), style));
             }
 
             // set_stringn clips at the BUFFER's right edge, not this
@@ -478,12 +485,12 @@ mod glyph_tests {
         recent.insert(PathBuf::new(), (FileAction::Edit, Fade::Bright));
         let rows = render_with(&recent, "touched.rs", 30);
         let row = rows.iter().find(|r| r.contains("touched.rs")).unwrap();
-        assert!(row.contains("touched.rs ✎"), "glyph after the name: {row:?}");
+        assert!(row.contains("touched.rs 📝"), "glyph after the name: {row:?}");
     }
 
     #[test]
     fn create_and_read_have_their_own_glyphs() {
-        for (action, glyph) in [(FileAction::Create, "+"), (FileAction::Read, "·")] {
+        for (action, glyph) in [(FileAction::Create, "✨"), (FileAction::Read, "👀")] {
             let mut recent = HashMap::new();
             recent.insert(PathBuf::new(), (action, Fade::Bright));
             let rows = render_with(&recent, "f.rs", 30);
@@ -495,12 +502,36 @@ mod glyph_tests {
         }
     }
 
+    /// Emoji ignore the terminal foreground color, so an old touch swaps to
+    /// a text glyph that CAN dim instead of an emoji that cannot.
+    #[test]
+    fn a_dim_touch_falls_back_to_a_gray_text_glyph() {
+        for (action, glyph) in [
+            (FileAction::Create, "+"),
+            (FileAction::Edit, "✎"),
+            (FileAction::Read, "·"),
+        ] {
+            let mut recent = HashMap::new();
+            recent.insert(PathBuf::new(), (action, Fade::Dim));
+            let rows = render_with(&recent, "f.rs", 30);
+            let row = rows.iter().find(|r| r.contains("f.rs")).unwrap();
+            assert!(
+                row.contains(&format!("f.rs {glyph}")),
+                "dim {action:?} should show {glyph}: {row:?}"
+            );
+            assert!(!row.contains('📝') && !row.contains('✨'), "{row:?}");
+        }
+    }
+
     #[test]
     fn untouched_files_get_no_glyph() {
         let recent = HashMap::new();
         let rows = render_with(&recent, "quiet.rs", 30);
         let row = rows.iter().find(|r| r.contains("quiet.rs")).unwrap();
-        assert!(!row.contains('✎') && !row.contains('+'), "{row:?}");
+        assert!(
+            !row.contains('📝') && !row.contains('✨') && !row.contains('✎'),
+            "{row:?}"
+        );
     }
 
     /// The glyph is one more segment: it must clip at the pane edge like

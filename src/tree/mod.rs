@@ -289,6 +289,17 @@ impl FileTree {
         self.h_offset = self.h_offset.min(self.content_width);
     }
 
+    /// Clamp the horizontal scroll to what the pane can actually need.
+    /// Called once per frame with the pane's real width: a resize is the
+    /// one event with no other hook, and an unclamped offset makes the
+    /// painted shift disagree with the thumb -- or strands a shifted,
+    /// bar-less view when the content newly fits.
+    pub fn clamp_h_offset(&mut self, visible_width: usize) {
+        self.h_offset = self
+            .h_offset
+            .min(self.content_width.saturating_sub(visible_width));
+    }
+
     pub fn show_hidden(&self) -> bool {
         self.show_hidden
     }
@@ -1158,5 +1169,18 @@ mod hscrollbar_tests {
         t.set_h_offset(30);
         t.set_nodes(Vec::new());
         assert_eq!(t.h_offset(), 0, "empty tree has nowhere to scroll");
+    }
+
+    /// A window resize is the one path with no other clamp hook: widen the
+    /// pane and a stale offset would paint the tree shifted while the thumb
+    /// (clamped inside the geometry) disagrees -- or with no bar at all.
+    #[test]
+    fn clamping_recovers_a_stale_offset_after_the_pane_widens() {
+        let mut t = wide_tree();
+        t.set_h_offset(18); // legitimate at visible_width = 20
+        t.clamp_h_offset(30); // pane widened: max is now 38 - 30 = 8
+        assert_eq!(t.h_offset(), 8);
+        t.clamp_h_offset(50); // content fits: no shift is legitimate
+        assert_eq!(t.h_offset(), 0);
     }
 }

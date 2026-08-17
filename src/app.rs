@@ -418,6 +418,7 @@ impl App {
                         let hthumb = self.tree.hscrollbar_thumb(track_width);
                         let on_hscrollbar = area.height > 0
                             && event.row == area.y + area.height - 1
+                            && event.column < area.x + track_width as u16
                             && hthumb.is_some();
 
                         match (on_scrollbar, thumb) {

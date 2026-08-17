@@ -123,6 +123,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Paragraph::new("  Scanning files...").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(loading, tree_inner);
     } else {
+        // A widened pane invalidates the horizontal scroll: re-clamp before
+        // anything reads it, so the painted shift, the thumb, and the mouse
+        // all agree on the same offset.
+        app.tree
+            .clamp_h_offset(tree_inner.width.saturating_sub(1) as usize);
+
         // Auto-scroll to keep CWD visible — only when CWD actually changes
         let visible_height = tree_inner.height as usize;
         let cwd = app.terminal.cwd();

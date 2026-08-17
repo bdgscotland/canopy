@@ -28,6 +28,54 @@ impl<'a> FileTreeWidget<'a> {
     }
 }
 
+/// Drop the first `cols` display columns of `s`. Returns the remainder and
+/// how far past `cols` the cut landed (1 when a wide character straddled
+/// the boundary and was dropped whole rather than split).
+fn skip_columns(s: &str, cols: usize) -> (&str, usize) {
+    let mut seen = 0usize;
+    for (i, ch) in s.char_indices() {
+        if seen >= cols {
+            return (&s[i..], seen - cols);
+        }
+        seen += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    ("", seen.saturating_sub(cols))
+}
+
+/// Paint `segments` on row `y` as one line shifted left by `skip` columns,
+/// clipped to `room` columns starting at `x0`. Returns the line's total
+/// UNSHIFTED width, so the caller can decide whether it was truncated.
+fn paint_shifted(
+    buf: &mut Buffer,
+    x0: u16,
+    y: u16,
+    room: usize,
+    skip: usize,
+    segments: &[(String, Style)],
+) -> usize {
+    let mut col = 0usize;
+    for (text, style) in segments {
+        let w = unicode_width::UnicodeWidthStr::width(text.as_str());
+        if col + w > skip {
+            if col >= skip {
+                let x = col - skip;
+                if x < room {
+                    buf.set_stringn(x0 + x as u16, y, text, room - x, *style);
+                }
+            } else {
+                // This segment straddles the left edge: drop the hidden
+                // prefix by display columns, never by bytes.
+                let (rest, pad) = skip_columns(text, skip - col);
+                if pad < room {
+                    buf.set_stringn(x0 + pad as u16, y, rest, room - pad, *style);
+                }
+            }
+        }
+        col += w;
+    }
+    col
+}
+
 impl<'a> StatefulWidget for FileTreeWidget<'a> {
     type State = FileTreeWidgetState;
 
@@ -107,57 +155,66 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
                 s
             };
 
-            let mut x_offset = area.x;
-
-            if node.depth == 0 {
-                // Root node: icon + name, no tree prefix
-                let icon = node.expanded_icon(!self.tree.is_collapsed(&node.path));
-                let display = if is_cwd {
-                    format!("{}● {}", icon, node.name)
-                } else {
-                    format!("{}{}", icon, node.name)
-                };
-                let room = (area.x + area.width).saturating_sub(x_offset + 1) as usize;
-                buf.set_stringn(x_offset, y, &display, room, node_style);
-                x_offset += unicode_width::UnicodeWidthStr::width(display.as_str()) as u16;
-            } else {
-                // Draw ancestor connectors
+            // Build the row as styled segments, then paint them shifted by
+            // the horizontal scroll. Building first is what lets a shift
+            // start mid-connector or mid-name without duplicating the
+            // slicing logic per segment kind.
+            let mut segments: Vec<(String, Style)> = Vec::new();
+            if node.depth > 0 {
+                let mut connectors = String::new();
                 for &ancestor_is_last in &node.connector {
-                    let connector_str = if ancestor_is_last { "  " } else { "│ " };
-                    buf.set_string(x_offset, y, connector_str, tree_style);
-                    x_offset += 2;
+                    connectors.push_str(if ancestor_is_last { "  " } else { "│ " });
                 }
-
-                // Draw this node's branch connector
-                let branch = if node.is_last { "└─" } else { "├─" };
-                buf.set_string(x_offset, y, branch, tree_style);
-                x_offset += 2;
-
-                // Draw icon + name
-                let icon = node.expanded_icon(!self.tree.is_collapsed(&node.path));
-                let display = if is_cwd {
-                    format!("{}● {}", icon, node.name)
-                } else {
-                    format!("{}{}", icon, node.name)
-                };
-                // set_string clips at the BUFFER's right edge, not this
-                // widget's, so an overlong name used to paint over the tree's
-                // own border. Reserve the last column for the scrollbar too.
-                let room = (area.x + area.width).saturating_sub(x_offset + 1) as usize;
-                buf.set_stringn(x_offset, y, &display, room, node_style);
-                x_offset += unicode_width::UnicodeWidthStr::width(display.as_str()) as u16;
+                connectors.push_str(if node.is_last { "└─" } else { "├─" });
+                segments.push((connectors, tree_style));
             }
+            let icon = node.expanded_icon(!self.tree.is_collapsed(&node.path));
+            let display = if is_cwd {
+                format!("{}● {}", icon, node.name)
+            } else {
+                format!("{}{}", icon, node.name)
+            };
+            segments.push((display, node_style));
+
+            // set_stringn clips at the BUFFER's right edge, not this
+            // widget's, so an overlong name used to paint over the tree's
+            // own border. Reserve the last column for the scrollbar too.
+            let room = area.width.saturating_sub(1) as usize;
+            let h_offset = self.tree.h_offset();
+            let total_width = paint_shifted(buf, area.x, y, room, h_offset, &segments);
 
             // Mark truncation one column in from the edge: the last column
             // belongs to the scrollbar, which is painted afterwards, so a
-            // marker written there was invisible exactly when the tree was long
-            // enough to need one.
-            let total_width = x_offset.saturating_sub(area.x);
-            if total_width > area.width.saturating_sub(1) {
+            // marker written there was invisible exactly when the tree was
+            // long enough to need one.
+            if total_width.saturating_sub(h_offset) > room {
                 if let Some(x) = area.x.checked_add(area.width.saturating_sub(2)) {
                     if let Some(cell) = buf.cell_mut((x, y)) {
                         cell.set_symbol("…");
                     }
+                }
+            }
+        }
+
+        // Horizontal scrollbar along the bottom row, overlaying it -- the
+        // same convention the vertical bar uses for the last column, and
+        // for the same reason: reserving a layout row would mean every
+        // height-based computation (thumb, paging, node_at_row, the
+        // auto-scroll margins) had to agree on whether it exists. The
+        // corner cell is left to the vertical bar.
+        let track_width = area.width.saturating_sub(1) as usize;
+        if let Some((thumb_pos, thumb_len)) = self.tree.hscrollbar_thumb(track_width) {
+            let bar_y = area.y + area.height - 1;
+            for x in 0..track_width {
+                let on_thumb = x >= thumb_pos && x < thumb_pos + thumb_len;
+                let ch = if on_thumb { "█" } else { "░" };
+                if let Some(cell) = buf.cell_mut((area.x + x as u16, bar_y)) {
+                    cell.set_symbol(ch);
+                    cell.set_fg(if on_thumb {
+                        Color::Gray
+                    } else {
+                        Color::DarkGray
+                    });
                 }
             }
         }
@@ -256,6 +313,78 @@ mod width_tests {
         assert!(
             deep.contains("file_node.rs"),
             "the name was truncated in a 24-column pane: {deep:?}"
+        );
+    }
+
+    fn render_tree_at(width: u16, h_offset: usize) -> Buffer {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("src/tree")).unwrap();
+        std::fs::write(d.path().join("src/tree/file_node.rs"), "x").unwrap();
+        let mut tree = FileTree::new(d.path(), false, 10).unwrap();
+        tree.set_nodes(crate::tree::walk(d.path(), false, 10, tree.collapsed_set()));
+        tree.set_h_offset(h_offset);
+
+        let area = Rect::new(0, 0, width, 10);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width + 4, 10));
+        let mut state = FileTreeWidgetState { offset: 0 };
+        FileTreeWidget::new(&tree, None).render(area, &mut buf, &mut state);
+        buf
+    }
+
+    fn row_text(buf: &Buffer, width: u16, y: u16) -> String {
+        (0..width)
+            .map(|x| buf.cell((x, y)).map_or(" ", |c| c.symbol()))
+            .collect()
+    }
+
+    /// Scrolling right by 8 removes the deep row's connectors (2 ancestor
+    /// entries + branch = 6 columns) and icon (2), so the row starts
+    /// directly at the name.
+    #[test]
+    fn a_shifted_row_starts_mid_line() {
+        let buf = render_tree_at(12, 8);
+        let found = (0..10).map(|y| row_text(&buf, 12, y)).any(|line| {
+            line.starts_with("file_node")
+        });
+        assert!(found, "shift of 8 must land exactly on the deep file's name");
+    }
+
+    #[test]
+    fn a_shifted_row_never_paints_past_the_pane() {
+        let width = 12u16;
+        let buf = render_tree_at(width, 8);
+        for y in 0..10 {
+            for x in width..width + 4 {
+                let sym = buf.cell((x, y)).map_or(" ", |c| c.symbol());
+                assert_eq!(sym, " ", "painted outside the pane at ({x},{y})");
+            }
+        }
+    }
+
+    /// Content is ~20 columns wide: a 12-column pane overflows (bar on the
+    /// bottom row), a 40-column pane does not (no bar).
+    #[test]
+    fn the_bar_appears_only_on_overflow_and_spares_the_corner() {
+        let narrow = render_tree_at(12, 0);
+        let bottom = row_text(&narrow, 12, 9);
+        assert!(
+            bottom.contains('█') && bottom.contains('░'),
+            "overflowing tree must draw the horizontal bar: {bottom:?}"
+        );
+        // The tree here is 5 nodes in 10 rows, so no vertical bar exists
+        // and the corner cell (owned by the vertical bar) must stay empty:
+        // the horizontal track stops one column short of it.
+        let corner = narrow.cell((11, 9)).map_or(" ", |c| c.symbol());
+        assert_eq!(
+            corner, " ",
+            "the corner cell belongs to the vertical bar, not the track"
+        );
+
+        let wide = render_tree_at(40, 0);
+        let bottom = row_text(&wide, 40, 9);
+        assert!(
+            !bottom.contains('░'),
+            "no horizontal bar when everything fits: {bottom:?}"
         );
     }
 

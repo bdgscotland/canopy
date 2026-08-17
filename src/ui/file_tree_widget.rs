@@ -1,9 +1,10 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use ratatui::{prelude::*, widgets::StatefulWidget};
 
 use super::FileTreeWidgetState;
-use crate::activity::ActivityKind;
+use crate::activity::{ActivityKind, Fade, FileAction};
 use crate::tree::FileTree;
 
 pub struct FileTreeWidget<'a> {
@@ -11,6 +12,9 @@ pub struct FileTreeWidget<'a> {
     cwd: Option<&'a Path>,
     /// The file Claude last touched, and how.
     highlight: Option<(&'a Path, ActivityKind)>,
+    /// Files touched recently and how, for the trailing glyphs. Fade is
+    /// precomputed by the caller so this widget stays clock-free.
+    recent: Option<&'a HashMap<PathBuf, (FileAction, Fade)>>,
 }
 
 impl<'a> FileTreeWidget<'a> {
@@ -19,11 +23,17 @@ impl<'a> FileTreeWidget<'a> {
             tree,
             cwd,
             highlight: None,
+            recent: None,
         }
     }
 
     pub fn highlight(mut self, highlight: Option<(&'a Path, ActivityKind)>) -> Self {
         self.highlight = highlight;
+        self
+    }
+
+    pub fn recent(mut self, recent: &'a HashMap<PathBuf, (FileAction, Fade)>) -> Self {
+        self.recent = Some(recent);
         self
     }
 }
@@ -175,6 +185,25 @@ impl<'a> StatefulWidget for FileTreeWidget<'a> {
                 format!("{}{}", icon, node.name)
             };
             segments.push((display, node_style));
+
+            // Trailing action glyph for recently-touched files. One more
+            // segment, so shifting and truncation treat it like content.
+            if let Some((action, fade)) = self.recent.and_then(|m| m.get(&node.path)) {
+                let glyph = match action {
+                    FileAction::Create => "+",
+                    FileAction::Edit | FileAction::Overwrite => "✎",
+                    FileAction::Read => "·",
+                };
+                let color = match (fade, action) {
+                    (Fade::Dim, _) => Color::DarkGray,
+                    (Fade::Bright, FileAction::Create) => Color::Green,
+                    (Fade::Bright, FileAction::Edit | FileAction::Overwrite) => {
+                        Color::Rgb(255, 214, 120)
+                    }
+                    (Fade::Bright, FileAction::Read) => Color::Rgb(150, 190, 240),
+                };
+                segments.push((format!(" {glyph}"), Style::default().fg(color)));
+            }
 
             // set_stringn clips at the BUFFER's right edge, not this
             // widget's, so an overlong name used to paint over the tree's
@@ -398,6 +427,105 @@ mod width_tests {
             for x in width..width + 4 {
                 let sym = buf.cell((x, y)).map_or(" ", |c| c.symbol());
                 assert_eq!(sym, " ", "painted outside the pane at ({x},{y}): {sym:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod glyph_tests {
+    use super::*;
+    use crate::activity::{Fade, FileAction};
+    use crate::tree::FileTree;
+    use ratatui::{buffer::Buffer, layout::Rect};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn render_with(
+        recent: &HashMap<PathBuf, (FileAction, Fade)>,
+        root_file: &str,
+        width: u16,
+    ) -> Vec<String> {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(root_file), "x").unwrap();
+        let mut tree = FileTree::new(d.path(), false, 10).unwrap();
+        tree.set_nodes(crate::tree::walk(d.path(), false, 10, tree.collapsed_set()));
+
+        // The tempdir path varies per run; key the map on the real path.
+        let mut keyed = HashMap::new();
+        for (_, v) in recent {
+            keyed.insert(d.path().join(root_file), *v);
+        }
+
+        let area = Rect::new(0, 0, width, 5);
+        let mut buf = Buffer::empty(area);
+        let mut state = FileTreeWidgetState { offset: 0 };
+        FileTreeWidget::new(&tree, None)
+            .recent(&keyed)
+            .render(area, &mut buf, &mut state);
+        (0..5)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf.cell((x, y)).map_or(" ", |c| c.symbol()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_recently_edited_file_gets_its_glyph() {
+        let mut recent = HashMap::new();
+        recent.insert(PathBuf::new(), (FileAction::Edit, Fade::Bright));
+        let rows = render_with(&recent, "touched.rs", 30);
+        let row = rows.iter().find(|r| r.contains("touched.rs")).unwrap();
+        assert!(row.contains("touched.rs ✎"), "glyph after the name: {row:?}");
+    }
+
+    #[test]
+    fn create_and_read_have_their_own_glyphs() {
+        for (action, glyph) in [(FileAction::Create, "+"), (FileAction::Read, "·")] {
+            let mut recent = HashMap::new();
+            recent.insert(PathBuf::new(), (action, Fade::Bright));
+            let rows = render_with(&recent, "f.rs", 30);
+            let row = rows.iter().find(|r| r.contains("f.rs")).unwrap();
+            assert!(
+                row.contains(&format!("f.rs {glyph}")),
+                "{action:?} should show {glyph}: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn untouched_files_get_no_glyph() {
+        let recent = HashMap::new();
+        let rows = render_with(&recent, "quiet.rs", 30);
+        let row = rows.iter().find(|r| r.contains("quiet.rs")).unwrap();
+        assert!(!row.contains('✎') && !row.contains('+'), "{row:?}");
+    }
+
+    /// The glyph is one more segment: it must clip at the pane edge like
+    /// everything else, not paint past it.
+    #[test]
+    fn glyphs_respect_the_pane_edge() {
+        let width = 10u16;
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a_much_longer_name.rs"), "x").unwrap();
+        let mut tree = FileTree::new(d.path(), false, 10).unwrap();
+        tree.set_nodes(crate::tree::walk(d.path(), false, 10, tree.collapsed_set()));
+        let mut keyed = HashMap::new();
+        keyed.insert(
+            d.path().join("a_much_longer_name.rs"),
+            (FileAction::Edit, Fade::Bright),
+        );
+        let area = Rect::new(0, 0, width, 5);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width + 4, 5));
+        let mut state = FileTreeWidgetState { offset: 0 };
+        FileTreeWidget::new(&tree, None)
+            .recent(&keyed)
+            .render(area, &mut buf, &mut state);
+        for y in 0..5 {
+            for x in width..width + 4 {
+                assert_eq!(buf.cell((x, y)).map_or(" ", |c| c.symbol()), " ");
             }
         }
     }

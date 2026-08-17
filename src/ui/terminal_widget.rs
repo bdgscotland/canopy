@@ -127,5 +127,29 @@ impl<'a> Widget for TerminalWidget<'a> {
                 }
             }
         }
+
+        // Scrollback scrollbar, overlaying the last column -- but only
+        // while scrolled back on the primary screen (the geometry method
+        // returns None otherwise), so Claude Code's alt-screen UI is never
+        // covered and the live view keeps its full width.
+        if area.width > 0 {
+            if let Some((thumb_pos, thumb_height)) =
+                vterm.scrollbar_thumb(area.height as usize)
+            {
+                let x = area.x + area.width - 1;
+                for y in 0..area.height as usize {
+                    let on_thumb = y >= thumb_pos && y < thumb_pos + thumb_height;
+                    let ch = if on_thumb { "█" } else { "░" };
+                    if let Some(cell) = buf.cell_mut((x, area.y + y as u16)) {
+                        cell.set_symbol(ch);
+                        cell.set_fg(if on_thumb {
+                            Color::Gray
+                        } else {
+                            Color::DarkGray
+                        });
+                    }
+                }
+            }
+        }
     }
 }

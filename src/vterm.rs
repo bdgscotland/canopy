@@ -367,6 +367,42 @@ impl VirtualTerminal {
         self.scroll_offset = offset.min(self.scrollback.len());
     }
 
+    /// Where the scrollback scrollbar thumb sits, or None when no bar
+    /// should be drawn: on the alt screen (no scrollback by design -- the
+    /// wheel is already translated to arrow keys there) and at the live
+    /// bottom, where a permanent bar would cover the child's last column.
+    /// Wheel up to enter scrollback and the bar appears.
+    pub fn scrollbar_thumb(&self, visible_height: usize) -> Option<(usize, usize)> {
+        if self.in_alternate_screen() || self.scroll_offset == 0 {
+            return None;
+        }
+        let total = self.scrollback.len() + self.grid.len();
+        // scroll_offset counts up from the bottom; the thumb from the top.
+        let offset_from_top = total
+            .saturating_sub(visible_height)
+            .saturating_sub(self.scroll_offset);
+        crate::scrollbar::thumb(total, visible_height, offset_from_top)
+    }
+
+    /// Scroll so the thumb's TOP lands on `row`, clamped. Used for a drag.
+    ///
+    /// Deliberately does NOT require the bar to be visible: a drag that
+    /// reaches the live bottom sets scroll_offset to 0, which hides the
+    /// bar, and the still-held drag must be able to pull back up.
+    pub fn scroll_to_thumb_row(&mut self, row: usize, visible_height: usize) {
+        if self.in_alternate_screen() {
+            return;
+        }
+        let total = self.scrollback.len() + self.grid.len();
+        if crate::scrollbar::thumb(total, visible_height, 0).is_none() {
+            return;
+        }
+        let offset_from_top =
+            crate::scrollbar::offset_for_thumb_pos(row, total, visible_height);
+        let max_offset = total.saturating_sub(visible_height);
+        self.set_scroll_offset(max_offset.saturating_sub(offset_from_top));
+    }
+
     pub fn cols(&self) -> usize {
         self.cols
     }
@@ -2104,6 +2140,63 @@ mod tests {
         vt.feed("한".as_bytes());
         assert_eq!(vt.cols, 0);
         assert_eq!(vt.rows, 0);
+    }
+
+    fn scrolled_back_vterm() -> VirtualTerminal {
+        let mut vt = VirtualTerminal::new(10, 5);
+        for i in 0..50 {
+            vt.feed(format!("line{i}\r\n").as_bytes());
+        }
+        assert!(vt.scrollback().len() >= 40, "history must have accumulated");
+        vt
+    }
+
+    #[test]
+    fn no_thumb_at_the_live_bottom() {
+        let vt = scrolled_back_vterm();
+        assert_eq!(vt.scroll_offset(), 0);
+        assert!(
+            vt.scrollbar_thumb(5).is_none(),
+            "at the bottom the bar would permanently cover the child's UI"
+        );
+    }
+
+    #[test]
+    fn no_thumb_on_the_alt_screen() {
+        let mut vt = scrolled_back_vterm();
+        vt.set_scroll_offset(10);
+        vt.feed(b"\x1b[?1049h");
+        assert!(
+            vt.scrollbar_thumb(5).is_none(),
+            "alt screen has no scrollback by design"
+        );
+    }
+
+    #[test]
+    fn the_thumb_appears_when_scrolled_back_and_tracks_position() {
+        let mut vt = scrolled_back_vterm();
+        vt.set_scroll_offset(1);
+        let (pos_low, len) = vt.scrollbar_thumb(5).expect("thumb while scrolled back");
+        assert!(pos_low + len <= 5, "inside the track");
+
+        vt.set_scroll_offset(usize::MAX); // clamps to the oldest line
+        let (pos_high, _) = vt.scrollbar_thumb(5).expect("thumb at the top");
+        assert_eq!(pos_high, 0, "oldest line puts the thumb at the top");
+        assert!(pos_low > pos_high, "nearly-live sits below fully-scrolled");
+    }
+
+    #[test]
+    fn a_drag_spans_the_whole_history() {
+        let mut vt = scrolled_back_vterm();
+        vt.set_scroll_offset(10);
+        vt.scroll_to_thumb_row(0, 5);
+        assert_eq!(
+            vt.scroll_offset(),
+            vt.scrollback().len(),
+            "thumb at the track top shows the oldest line"
+        );
+        vt.scroll_to_thumb_row(5, 5);
+        assert_eq!(vt.scroll_offset(), 0, "thumb at the bottom returns to live");
     }
 }
 

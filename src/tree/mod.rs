@@ -26,6 +26,11 @@ pub struct FileTree {
     pub show_hidden: bool,
     max_depth: usize,
     offset: usize,
+    /// Columns the view is scrolled right. 0 = flush left.
+    h_offset: usize,
+    /// Widest line in the tree in display columns, cached by set_nodes so
+    /// the horizontal scrollbar geometry never walks the node list.
+    content_width: usize,
     /// Used to discard filesystem events for paths the tree never shows.
     ignores: Gitignore,
     /// Directories the user has collapsed. Stored as COLLAPSED rather than
@@ -46,6 +51,8 @@ impl FileTree {
             show_hidden,
             max_depth,
             offset: 0,
+            h_offset: 0,
+            content_width: 0,
             ignores: build_ignores(root),
             collapsed: std::collections::HashSet::new(),
             auto_expanded: Vec::new(),
@@ -206,6 +213,44 @@ impl FileTree {
         };
     }
 
+    pub fn h_offset(&self) -> usize {
+        self.h_offset
+    }
+
+    pub fn set_h_offset(&mut self, offset: usize) {
+        self.h_offset = offset;
+    }
+
+    pub fn content_width(&self) -> usize {
+        self.content_width
+    }
+
+    /// Horizontal scrollbar thumb as (column, length) in track cells, or
+    /// None when the tree fits. Shared by renderer and mouse handler for
+    /// the same reason as the vertical one.
+    pub fn hscrollbar_thumb(&self, visible_width: usize) -> Option<(usize, usize)> {
+        crate::scrollbar::thumb(self.content_width, visible_width, self.h_offset)
+    }
+
+    /// Scroll so the thumb's LEFT edge lands on `col`, clamped. For drags.
+    pub fn scroll_to_hthumb_col(&mut self, col: usize, visible_width: usize) {
+        if self.hscrollbar_thumb(visible_width).is_none() {
+            return;
+        }
+        self.h_offset =
+            crate::scrollbar::offset_for_thumb_pos(col, self.content_width, visible_width);
+    }
+
+    /// Page left or right, for a click on the track either side of the thumb.
+    pub fn hpage(&mut self, right: bool, visible_width: usize) {
+        let max_offset = self.content_width.saturating_sub(visible_width);
+        self.h_offset = if right {
+            (self.h_offset + visible_width).min(max_offset)
+        } else {
+            self.h_offset.saturating_sub(visible_width)
+        };
+    }
+
     /// Collapse a directory and every directory beneath it.
     ///
     /// Folding the root should fold the whole tree, not just hide it: when the
@@ -238,6 +283,10 @@ impl FileTree {
         self.nodes = nodes;
         let max_offset = self.nodes.len().saturating_sub(1);
         self.offset = self.offset.min(max_offset);
+        self.content_width = self.nodes.iter().map(line_width).max().unwrap_or(0);
+        // A fold that narrows the tree must not leave the view scrolled
+        // past the content, same as the vertical clamp above.
+        self.h_offset = self.h_offset.min(self.content_width);
     }
 
     pub fn show_hidden(&self) -> bool {
@@ -363,6 +412,15 @@ fn emit_children(
             );
         }
     }
+}
+
+/// Display width of a node's rendered line: indent, icon, name. The
+/// connectors cost 2 columns per depth level and the icon is always 2
+/// ("▾ ", "▸ ", "· "). The transient 2-column CWD marker is deliberately
+/// excluded: it moves with the child's cwd, and the right-edge truncation
+/// marker covers the rare frame where the CWD line is also the widest.
+fn line_width(node: &FileNode) -> usize {
+    node.depth * 2 + 2 + unicode_width::UnicodeWidthStr::width(node.name.as_str())
 }
 
 impl FileTree {
@@ -1026,5 +1084,79 @@ mod recursive_collapse_tests {
             "sibling content vanished"
         );
         assert!(!t.nodes().iter().any(|n| n.name == "deep.rs"));
+    }
+}
+
+#[cfg(test)]
+mod hscrollbar_tests {
+    use super::*;
+
+    /// A tree whose widest line is `deep/a_really_quite_long_file_name.rs`
+    /// at depth 2: 2*2 connector columns + 2 icon columns + 32 name = 38.
+    fn wide_tree() -> FileTree {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("deep")).unwrap();
+        std::fs::write(d.path().join("deep/a_really_quite_long_file_name.rs"), "x").unwrap();
+        let mut t = FileTree::new(d.path(), false, 10).unwrap();
+        t.set_nodes(walk(d.path(), false, 10, t.collapsed_set()));
+        t
+    }
+
+    #[test]
+    fn content_width_is_the_widest_line_in_columns() {
+        let t = wide_tree();
+        assert_eq!(t.content_width(), 38, "2*depth + icon + name");
+    }
+
+    #[test]
+    fn no_thumb_when_the_pane_is_wide_enough() {
+        let t = wide_tree();
+        assert!(t.hscrollbar_thumb(38).is_none());
+        assert!(t.hscrollbar_thumb(80).is_none());
+        assert!(t.hscrollbar_thumb(0).is_none());
+    }
+
+    #[test]
+    fn the_thumb_stays_inside_the_track_at_every_offset() {
+        let mut t = wide_tree();
+        let visible = 20;
+        for offset in 0..=(t.content_width() - visible) {
+            t.set_h_offset(offset);
+            let (pos, len) = t.hscrollbar_thumb(visible).expect("thumb");
+            assert!(pos + len <= visible, "escaped the track at offset {offset}");
+        }
+    }
+
+    #[test]
+    fn a_drag_lands_where_the_thumb_is_drawn() {
+        let mut t = wide_tree();
+        let visible = 20;
+        t.scroll_to_hthumb_col(visible, visible); // past the end: clamps
+        assert_eq!(t.h_offset(), t.content_width() - visible);
+        t.scroll_to_hthumb_col(0, visible);
+        assert_eq!(t.h_offset(), 0);
+    }
+
+    #[test]
+    fn hpage_moves_one_viewport_and_clamps() {
+        let mut t = wide_tree();
+        let visible = 20;
+        t.hpage(true, visible);
+        assert_eq!(t.h_offset(), t.content_width() - visible, "one page covers it");
+        t.hpage(true, visible);
+        assert_eq!(t.h_offset(), t.content_width() - visible, "clamped at the end");
+        t.hpage(false, visible);
+        assert_eq!(t.h_offset(), 0);
+    }
+
+    /// A fold that narrows the tree must not leave the view scrolled past
+    /// the content -- the vertical axis clamps in set_nodes for the same
+    /// reason.
+    #[test]
+    fn set_nodes_clamps_a_stale_h_offset() {
+        let mut t = wide_tree();
+        t.set_h_offset(30);
+        t.set_nodes(Vec::new());
+        assert_eq!(t.h_offset(), 0, "empty tree has nowhere to scroll");
     }
 }
